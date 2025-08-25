@@ -1,0 +1,5 @@
+documents/
+output_dir/
+__pycache__/
+venv/
+*.pyc
