@@ -3,3 +3,4 @@ output_dir/
 __pycache__/
 venv/
 *.pyc
+.idea/
