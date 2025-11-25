@@ -407,4 +407,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=500, workers=6)
+    process_doc_poster_generate_queue(limit=500, workers=4)
