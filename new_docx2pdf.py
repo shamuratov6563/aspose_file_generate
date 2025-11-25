@@ -11,9 +11,16 @@ from multiprocessing import Process, Queue, cpu_count
 import time
 import pathlib
 import subprocess
-from main_apose import token, BASE_URL
+from dotenv import load_dotenv
+import os
 
-headers = {'Authorization': f"Bearer {token}"}
+load_dotenv()  # This loads variables from a .env file in the current directory
+
+# Access environment variables
+TOKEN = os.getenv("TOKEN")
+BASE_URL = os.getenv("BASE_URL")
+
+headers = {'Authorization': f"Bearer {TOKEN}"}
 
 
 def not_pdf_to_images_webp_libreoffice(ppt_path, output_folder, quality=15, max_width=800, max_slides=4):
