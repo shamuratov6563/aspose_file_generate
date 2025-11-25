@@ -1,18 +1,19 @@
+import glob
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
-import glob
+from contextlib import ExitStack
+from multiprocessing import Process, Queue, cpu_count
+
 import requests
 from PIL import Image
-from pdf2image import convert_from_path
-from multiprocessing import Process, Queue, cpu_count
-import time
-import pathlib
-import subprocess
+from pdf2image import convert_from_path, pdfinfo_from_path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
-import os
 
 load_dotenv()  # This loads variables from a .env file in the current directory
 
@@ -22,8 +23,42 @@ BASE_URL = os.getenv("BASE_URL")
 
 headers = {'Authorization': f"Bearer {TOKEN}"}
 
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
+DOWNLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB chunks for large files
+DEFAULT_MAX_SLIDES = 4
+DEFAULT_MAX_PDF_PAGES = 3
+PDF_DPI = 200
 
-def not_pdf_to_images_webp_libreoffice(ppt_path, output_folder, quality=15, max_width=800, max_slides=4):
+session = requests.Session()
+session.headers.update(headers)
+retry_strategy = Retry(
+    total=5,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=("GET", "PATCH"),
+)
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=16, pool_maxsize=32)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+
+def get_pdf_page_count(pdf_path: str) -> int | None:
+    """Return the total page count for a PDF, if available."""
+    try:
+        info = pdfinfo_from_path(pdf_path)
+        return int(info.get("Pages", 0))
+    except Exception as exc:
+        print(f"⚠️ Unable to read PDF info for {pdf_path}: {exc}")
+        return None
+
+
+def not_pdf_to_images_webp_libreoffice(
+    ppt_path,
+    output_folder,
+    quality=15,
+    max_width=800,
+    max_slides=DEFAULT_MAX_SLIDES,
+):
     abs_ppt = os.path.abspath(ppt_path)
     abs_output = tempfile.mkdtemp(prefix="libreoffice_out_")
     os.makedirs(output_folder, exist_ok=True)
@@ -55,10 +90,16 @@ def not_pdf_to_images_webp_libreoffice(ppt_path, output_folder, quality=15, max_
     pdf_path = pdf_candidates[0]  # pick first PDF
     print(f"📄 Using generated PDF: {pdf_path}")
 
-    pages = convert_from_path(pdf_path, dpi=200)
+    total_pages = get_pdf_page_count(pdf_path)
+    pages = convert_from_path(
+        pdf_path,
+        dpi=PDF_DPI,
+        first_page=1,
+        last_page=max_slides,
+    )
     saved_paths = []
 
-    for i, pil_img in enumerate(pages[:max_slides], start=1):
+    for i, pil_img in enumerate(pages, start=1):
         if pil_img.width > max_width:
             ratio = max_width / pil_img.width
             new_height = int(pil_img.height * ratio)
@@ -72,12 +113,24 @@ def not_pdf_to_images_webp_libreoffice(ppt_path, output_folder, quality=15, max_
     shutil.rmtree(abs_output, ignore_errors=True)
     shutil.rmtree(profile_dir, ignore_errors=True)
 
-    return saved_paths, len(pages)
+    return saved_paths, total_pages or len(pages)
 
 
-def pdf_to_images_webp(pdf_path, output_folder, quality=60, max_width=None):
+def pdf_to_images_webp(
+    pdf_path,
+    output_folder,
+    quality=60,
+    max_width=None,
+    max_pages=DEFAULT_MAX_PDF_PAGES,
+):
     os.makedirs(output_folder, exist_ok=True)
-    images = convert_from_path(pdf_path)
+    total_pages = get_pdf_page_count(pdf_path)
+    images = convert_from_path(
+        pdf_path,
+        first_page=1,
+        last_page=max_pages,
+        dpi=PDF_DPI,
+    )
 
     for i, img in enumerate(images):
         if max_width and img.width > max_width:
@@ -88,14 +141,19 @@ def pdf_to_images_webp(pdf_path, output_folder, quality=60, max_width=None):
         img_path = os.path.join(output_folder, f"page_{i+1}.webp")
         img.save(img_path, "WEBP", quality=quality)
 
-    return [os.path.join(output_folder, f"page_{i+1}.webp") for i in range(len(images))], len(images)
+    return (
+        [os.path.join(output_folder, f"page_{i+1}.webp") for i in range(len(images))],
+        total_pages or len(images),
+    )
 
 
 def download_file(file_url, save_path):
-    response = requests.get(file_url)
-    response.raise_for_status()
-    with open(save_path, 'wb') as f:
-        f.write(response.content)
+    with session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+        response.raise_for_status()
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if chunk:
+                    f.write(chunk)
 
 
 from lxml import etree as ET
@@ -218,7 +276,11 @@ def generate_docs_for_soff(doc_id):
     temp_path = None
     output_folder = None
     try:
-        response = requests.get(f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/', headers=headers, stream=True)
+        response = session.get(
+            f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/',
+            stream=True,
+            timeout=REQUEST_TIMEOUT,
+        )
         data = response.json()
         file_type = data['document']['file_type'].lower()
         file_url = data['document']['file_url']
@@ -227,19 +289,27 @@ def generate_docs_for_soff(doc_id):
         temp_path = f"temp_copy_{doc_id}{file_type}"
         output_folder = f"images_slide_copy_{doc_id}"
 
-        image_path = []
-
         download_file(file_url, temp_path)
         repaired = None
         if file_type in ['.pptx', '.ppt', '.doc', '.docx'] and os.path.exists(temp_path):
             try:
-                image_paths, pages_count = not_pdf_to_images_webp_libreoffice(temp_path, output_folder, quality=60, max_width=800)
+                image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
+                    temp_path,
+                    output_folder,
+                    quality=60,
+                    max_width=800,
+                )
 
             except Exception as e:
                 print(f"⚠️ LibreOffice failed on {temp_path}: {e}")
                 repaired = try_repair_office_file(temp_path)
                 if repaired:
-                    image_paths, pages_count = not_pdf_to_images_webp_libreoffice(repaired, output_folder, quality=60, max_width=800)
+                    image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
+                        repaired,
+                        output_folder,
+                        quality=60,
+                        max_width=800,
+                    )
                 else:
                     print(f"❌ Skipping doc_id={doc_id}, corrupted file.")
                     return False
@@ -250,20 +320,32 @@ def generate_docs_for_soff(doc_id):
                     os.remove(temp_path)
 
         elif file_type == '.pdf':
-            image_paths, pages_count = pdf_to_images_webp(temp_path, output_folder, quality=60)
-            image_paths = image_paths[:3]
+            image_paths, pages_count = pdf_to_images_webp(
+                temp_path,
+                output_folder,
+                quality=60,
+            )
         else:
             return True
 
         # Upload images back
-        print(len(image_path), 'len')
-        files = []
-        for path in image_paths:
-            files.append(("images", (os.path.basename(path), open(path, "rb"), "image/webp")))
+        with ExitStack() as stack:
+            files = []
+            for path in image_paths:
+                file_handle = stack.enter_context(open(path, "rb"))
+                files.append((
+                    "images",
+                    (os.path.basename(path), file_handle, "image/webp"),
+                ))
 
-        data = {'page_count': pages_count}
+            data = {'page_count': pages_count}
 
-        requests.patch(f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/", files=files, headers=headers, data=data)
+            session.patch(
+                f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
+                files=files,
+                data=data,
+                timeout=REQUEST_TIMEOUT,
+            )
         print(f"✅ Finished doc_id={doc_id}")
 
     except Exception as e:
@@ -304,7 +386,7 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
         if start:
             endpoint += f"&pk={start}"
 
-        response = requests.get(endpoint, headers=headers)
+        response = session.get(endpoint, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             data = response.json()
             doc_id = data.get('id')
