@@ -6,13 +6,13 @@ import tempfile
 import time
 import zipfile
 from contextlib import ExitStack
-from multiprocessing import Process, Queue, cpu_count
-
 import requests
 from PIL import Image
 from pdf2image import convert_from_path, pdfinfo_from_path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from celery_worker import convert_doc_task
 from dotenv import load_dotenv
 
 load_dotenv()  # This loads variables from a .env file in the current directory
@@ -275,6 +275,7 @@ def try_repair_office_file(path: str) -> str | None:
 def generate_docs_for_soff(doc_id):
     temp_path = None
     output_folder = None
+    success = False
     try:
         response = session.get(
             f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/',
@@ -347,6 +348,7 @@ def generate_docs_for_soff(doc_id):
                 timeout=REQUEST_TIMEOUT,
             )
         print(f"✅ Finished doc_id={doc_id}")
+        success = True
 
     except Exception as e:
         print(f"❌ Error doc_id={doc_id}: {e}")
@@ -358,27 +360,15 @@ def generate_docs_for_soff(doc_id):
         if output_folder and os.path.exists(output_folder):
             shutil.rmtree(output_folder)
 
-    return True
+    return success
 # ========= Worker & Queue System =========
 
 
-def worker(queue: Queue):
-    while True:
-        doc_id = queue.get()
-        if doc_id is None:  # Poison pill -> stop worker
-            break
-        generate_docs_for_soff(doc_id)
-
-
-def process_doc_poster_generate_queue(limit=100, workers=None):
-    workers = workers or max(2, cpu_count() // 2)
-    queue = Queue(maxsize=workers * 2)
-
-    # Start workers
-    processes = [Process(target=worker, args=(queue,)) for _ in range(workers)]
-    for p in processes:
-        p.start()
-
+def process_doc_poster_generate_queue(limit=100):
+    """
+    Instead of spawning local processes, enqueue doc_ids onto the Celery queue so
+    background workers handle conversions with retries.
+    """
     start = 660546
 
     for _ in range(limit):
@@ -392,18 +382,11 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
             doc_id = data.get('id')
             if not doc_id:
                 break
-            print(f"📥 Queued doc_id={doc_id}")
-            queue.put(doc_id)
-            print("last...")
+            print(f"📥 Enqueuing doc_id={doc_id} to Celery")
+            convert_doc_task.apply_async(args=(doc_id,))
             start = doc_id + 1
 
         time.sleep(0.2)  # avoid hammering API
-
-    # Stop workers
-    for _ in processes:
-        queue.put(None)
-    for p in processes:
-        p.join()
 
 
 if __name__ == "__main__":
