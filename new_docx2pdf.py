@@ -95,6 +95,53 @@ def check_xvfb_available():
         return False
 
 
+def configure_libreoffice_profile(profile_dir: str):
+    """
+    Configure LibreOffice profile to disable Java and X11 requirements.
+    Creates configuration files that tell LibreOffice not to use Java.
+    """
+    try:
+        # Create config directory structure
+        config_dir = os.path.join(profile_dir, "user", "config")
+        os.makedirs(config_dir, exist_ok=True)
+        
+        # Create javasettings file to disable Java
+        javasettings_file = os.path.join(config_dir, "javasettings_Linux_x86_64.xml")
+        javasettings_content = '''<?xml version="1.0" encoding="UTF-8"?>
+<oor:component-data xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" oor:name="Java" oor:package="org.openoffice.Office">
+  <node oor:name="JavaInfo">
+    <node oor:name="JavaList">
+      <prop oor:name="JavaCount" oor:type="xs:int">
+        <value>0</value>
+      </prop>
+    </node>
+  </node>
+</oor:component-data>'''
+        
+        with open(javasettings_file, 'w') as f:
+            f.write(javasettings_content)
+        
+        # Create registrymodifications file to disable Java
+        registry_dir = os.path.join(profile_dir, "user", "registrymodifications.xcu")
+        if not os.path.exists(registry_dir):
+            os.makedirs(os.path.dirname(registry_dir), exist_ok=True)
+            registry_content = '''<?xml version="1.0" encoding="UTF-8"?>
+<oor:component-data xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" oor:name="Common" oor:package="org.openoffice.Office">
+  <node oor:name="Misc">
+    <node oor:name="FirstRun">
+      <prop oor:name="bCompleted" oor:type="xs:boolean">
+        <value>true</value>
+      </prop>
+    </node>
+  </node>
+</oor:component-data>'''
+            with open(registry_dir, 'w') as f:
+                f.write(registry_content)
+    except Exception as e:
+        # If profile configuration fails, continue anyway
+        print(f"⚠️ Could not configure LibreOffice profile: {e}")
+
+
 def not_pdf_to_images_webp_libreoffice(
     ppt_path,
     output_folder,
@@ -107,6 +154,9 @@ def not_pdf_to_images_webp_libreoffice(
     os.makedirs(output_folder, exist_ok=True)
 
     profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_")
+    
+    # Configure LibreOffice profile to disable Java
+    configure_libreoffice_profile(profile_dir)
     
     # Create environment for headless LibreOffice operation
     env = os.environ.copy()
@@ -312,6 +362,10 @@ def try_repair_office_file(path: str) -> str | None:
     if path.lower().endswith(".ppt") and not path.lower().endswith(".pptx"):
         pptx_path = path.replace(".ppt", ".pptx")
         try:
+            # Create temporary profile for this conversion
+            temp_profile = tempfile.mkdtemp(prefix="libreoffice_profile_")
+            configure_libreoffice_profile(temp_profile)
+            
             # Create environment for headless LibreOffice operation
             env = os.environ.copy()
             env.pop('DISPLAY', None)
@@ -322,7 +376,14 @@ def try_repair_office_file(path: str) -> str | None:
             env.pop('JDK_HOME', None)
             
             # Build command
-            soffice_cmd = ["soffice", "--headless", "--nologo", "--convert-to", "pptx", path]
+            soffice_cmd = [
+                "soffice",
+                "--headless",
+                "--nologo",
+                f"-env:UserInstallation=file://{temp_profile}",
+                "--convert-to", "pptx",
+                path
+            ]
             
             # Use xvfb-run if available
             use_xvfb = check_xvfb_available()
@@ -336,6 +397,9 @@ def try_repair_office_file(path: str) -> str | None:
                 preexec_fn=set_process_limits if not use_xvfb else None,
                 env=env
             )
+            # Cleanup temp profile
+            shutil.rmtree(temp_profile, ignore_errors=True)
+            
             if os.path.exists(pptx_path):
                 print(f"🌀 Converted old PPT → PPTX: {pptx_path}")
                 path = pptx_path
@@ -344,6 +408,9 @@ def try_repair_office_file(path: str) -> str | None:
                 return None
         except Exception as e:
             print(f"❌ LibreOffice conversion failed for {path}: {e}")
+            # Cleanup temp profile on error
+            if 'temp_profile' in locals():
+                shutil.rmtree(temp_profile, ignore_errors=True)
             return None
 
     if not zipfile.is_zipfile(path):
