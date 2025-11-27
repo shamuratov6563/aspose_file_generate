@@ -81,6 +81,20 @@ def set_process_limits():
         print(f"⚠️ Could not set all resource limits: {e}")
 
 
+def check_xvfb_available():
+    """Check if xvfb-run is available for virtual display."""
+    try:
+        result = subprocess.run(
+            ["which", "xvfb-run"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def not_pdf_to_images_webp_libreoffice(
     ppt_path,
     output_folder,
@@ -94,15 +108,20 @@ def not_pdf_to_images_webp_libreoffice(
 
     profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_")
     
-    # Create environment without Java to avoid Java dependency errors
+    # Create environment for headless LibreOffice operation
     env = os.environ.copy()
-    env['SAL_DISABLE_OPENCL'] = '1'
+    # Disable X11/display requirements - unset DISPLAY to prevent X11 errors
+    env.pop('DISPLAY', None)
+    # Use generic VCL plugin that doesn't require X11
     env['SAL_USE_VCLPLUGIN'] = 'gen'
-    # Disable Java by setting empty Java home
-    env['JAVA_HOME'] = ''
-    env.pop('JAVA_HOME', None)  # Remove if exists
+    env['SAL_DISABLE_OPENCL'] = '1'
+    # Disable Java to avoid Java dependency errors
+    env.pop('JAVA_HOME', None)
+    env.pop('JRE_HOME', None)
+    env.pop('JDK_HOME', None)
     
-    result = subprocess.run([
+    # Build LibreOffice command
+    soffice_cmd = [
         "soffice",
         "--headless",
         "--norestore",
@@ -113,8 +132,28 @@ def not_pdf_to_images_webp_libreoffice(
         "--convert-to", "pdf",
         "--outdir", abs_output,
         abs_ppt
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, 
-       timeout=LIBREOFFICE_TIMEOUT, preexec_fn=set_process_limits, env=env)
+    ]
+    
+    # Try using xvfb-run if available to provide virtual display
+    use_xvfb = check_xvfb_available()
+    if use_xvfb:
+        # Wrap command with xvfb-run for virtual display
+        soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
+        # xvfb-run handles DISPLAY, so we can remove it from env
+    else:
+        # If xvfb not available, try with dummy DISPLAY
+        # Some LibreOffice versions work with a dummy display
+        env['DISPLAY'] = ':99'
+    
+    result = subprocess.run(
+        soffice_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=LIBREOFFICE_TIMEOUT,
+        preexec_fn=set_process_limits if not use_xvfb else None,  # xvfb-run handles its own process
+        env=env
+    )
 
     print("STDOUT:", result.stdout)
     print("STDERR:", result.stderr)
@@ -263,11 +302,15 @@ def try_repair_office_file(path: str) -> str | None:
     if path.lower().endswith(".ppt") and not path.lower().endswith(".pptx"):
         pptx_path = path.replace(".ppt", ".pptx")
         try:
-            # Create environment without Java to avoid Java dependency errors
+            # Create environment for headless LibreOffice operation
             env = os.environ.copy()
+            # Disable X11/display requirements
+            env.pop('DISPLAY', None)
             env['SAL_DISABLE_OPENCL'] = '1'
             env['SAL_USE_VCLPLUGIN'] = 'gen'
-            env.pop('JAVA_HOME', None)  # Remove Java home if exists
+            # Disable Java
+            env.pop('JAVA_HOME', None)
+            env.pop('JRE_HOME', None)
             
             subprocess.run(
                 ["soffice", "--headless", "--nologo", "--convert-to", "pptx", path],
