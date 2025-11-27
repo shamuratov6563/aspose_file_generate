@@ -441,7 +441,7 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
     for p in processes:
         p.start()
 
-    start = 660546
+    start = 1
 
     for _ in range(limit):
         endpoint = f"{BASE_URL}/api/v1/seller/moderation-change/?type=true"
@@ -469,4 +469,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=500, workers=6)
+    process_doc_poster_generate_queue(limit=500, workers=4)
