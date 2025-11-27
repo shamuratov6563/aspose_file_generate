@@ -1,5 +1,6 @@
 import glob
 import os
+import resource
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +30,10 @@ DEFAULT_MAX_SLIDES = 4
 DEFAULT_MAX_PDF_PAGES = 3
 PDF_DPI = 200
 
+# LibreOffice conversion limits (configurable via environment variables)
+LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "180"))  # 10 minutes default
+LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "2048"))  # 2GB default
+
 session = requests.Session()
 session.headers.update(headers)
 retry_strategy = Retry(
@@ -50,6 +55,30 @@ def get_pdf_page_count(pdf_path: str) -> int | None:
     except Exception as exc:
         print(f"⚠️ Unable to read PDF info for {pdf_path}: {exc}")
         return None
+
+
+def set_process_limits():
+    """
+    Set resource limits for the current process (used as preexec_fn for subprocess).
+    Limits memory usage and CPU time for LibreOffice conversion.
+    Only works on Unix-like systems (Linux, macOS).
+    """
+    try:
+        # Set memory limit in bytes
+        memory_limit_bytes = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 1024
+        # RLIMIT_AS limits the virtual memory address space
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+        
+        # Set CPU time limit in seconds (soft and hard limit)
+        cpu_time_limit = LIBREOFFICE_TIMEOUT
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_time_limit, cpu_time_limit))
+        
+        # Set data segment size limit (heap memory)
+        resource.setrlimit(resource.RLIMIT_DATA, (memory_limit_bytes, memory_limit_bytes))
+    except (ValueError, OSError, AttributeError) as e:
+        # On some systems, setting limits might fail - log but don't fail
+        # AttributeError can occur if resource module doesn't have the constant
+        print(f"⚠️ Could not set all resource limits: {e}")
 
 
 def not_pdf_to_images_webp_libreoffice(
@@ -74,7 +103,8 @@ def not_pdf_to_images_webp_libreoffice(
         "--convert-to", "pdf",
         "--outdir", abs_output,
         abs_ppt
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, 
+       timeout=LIBREOFFICE_TIMEOUT, preexec_fn=set_process_limits)
 
     print("STDOUT:", result.stdout)
     print("STDERR:", result.stderr)
@@ -212,7 +242,9 @@ def try_repair_office_file(path: str) -> str | None:
         try:
             subprocess.run(
                 ["soffice", "--headless", "--convert-to", "pptx", path],
-                check=True
+                check=True,
+                timeout=LIBREOFFICE_TIMEOUT,
+                preexec_fn=set_process_limits
             )
             if os.path.exists(pptx_path):
                 print(f"🌀 Converted old PPT → PPTX: {pptx_path}")
