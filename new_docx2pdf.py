@@ -93,29 +93,52 @@ def not_pdf_to_images_webp_libreoffice(
     os.makedirs(output_folder, exist_ok=True)
 
     profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_")
+    
+    # Create environment without Java to avoid Java dependency errors
+    env = os.environ.copy()
+    env['SAL_DISABLE_OPENCL'] = '1'
+    env['SAL_USE_VCLPLUGIN'] = 'gen'
+    # Disable Java by setting empty Java home
+    env['JAVA_HOME'] = ''
+    env.pop('JAVA_HOME', None)  # Remove if exists
+    
     result = subprocess.run([
         "soffice",
         "--headless",
         "--norestore",
         "--nolockcheck",
         "--nodefault",
+        "--nologo",
         f"-env:UserInstallation=file://{profile_dir}",
         "--convert-to", "pdf",
         "--outdir", abs_output,
         abs_ppt
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, 
-       timeout=LIBREOFFICE_TIMEOUT, preexec_fn=set_process_limits)
+       timeout=LIBREOFFICE_TIMEOUT, preexec_fn=set_process_limits, env=env)
 
     print("STDOUT:", result.stdout)
     print("STDERR:", result.stderr)
 
-    if result.returncode != 0:
-        raise RuntimeError(f"LibreOffice failed: {result.stderr}\n{result.stdout}")
-
     # Find any PDF in the output folder
     pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
+    
+    # Check if PDF was actually created, even if returncode is non-zero
+    # (Java warnings can cause non-zero exit codes even when conversion succeeds)
     if not pdf_candidates:
+        if result.returncode != 0:
+            raise RuntimeError(f"LibreOffice failed: {result.stderr}\n{result.stdout}")
         raise RuntimeError(f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
+    
+    # If PDF was created but returncode is non-zero, log warning but continue
+    if result.returncode != 0:
+        # Check if stderr only contains Java-related warnings
+        stderr_lower = result.stderr.lower()
+        java_warnings = ['java', 'javaldx', 'jvm', 'java runtime environment']
+        if any(warning in stderr_lower for warning in java_warnings):
+            print(f"⚠️ LibreOffice completed conversion but reported Java warnings (PDF was created): {result.stderr}")
+        else:
+            # Non-Java error, but PDF exists - log warning but proceed
+            print(f"⚠️ LibreOffice returned non-zero exit code but PDF was created: {result.stderr}")
 
     pdf_path = pdf_candidates[0]  # pick first PDF
     print(f"📄 Using generated PDF: {pdf_path}")
@@ -240,11 +263,18 @@ def try_repair_office_file(path: str) -> str | None:
     if path.lower().endswith(".ppt") and not path.lower().endswith(".pptx"):
         pptx_path = path.replace(".ppt", ".pptx")
         try:
+            # Create environment without Java to avoid Java dependency errors
+            env = os.environ.copy()
+            env['SAL_DISABLE_OPENCL'] = '1'
+            env['SAL_USE_VCLPLUGIN'] = 'gen'
+            env.pop('JAVA_HOME', None)  # Remove Java home if exists
+            
             subprocess.run(
-                ["soffice", "--headless", "--convert-to", "pptx", path],
+                ["soffice", "--headless", "--nologo", "--convert-to", "pptx", path],
                 check=True,
                 timeout=LIBREOFFICE_TIMEOUT,
-                preexec_fn=set_process_limits
+                preexec_fn=set_process_limits,
+                env=env
             )
             if os.path.exists(pptx_path):
                 print(f"🌀 Converted old PPT → PPTX: {pptx_path}")
