@@ -138,12 +138,11 @@ def not_pdf_to_images_webp_libreoffice(
     use_xvfb = check_xvfb_available()
     if use_xvfb:
         # Wrap command with xvfb-run for virtual display
+        # -a: auto-display number, -s: server args, screen 0: virtual screen
         soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
-        # xvfb-run handles DISPLAY, so we can remove it from env
-    else:
-        # If xvfb not available, try with dummy DISPLAY
-        # Some LibreOffice versions work with a dummy display
-        env['DISPLAY'] = ':99'
+        print("ℹ️ Using xvfb-run for virtual display")
+    # If xvfb not available, DISPLAY is unset - LibreOffice should work in headless mode
+    # but some versions may still require a display
     
     result = subprocess.run(
         soffice_cmd,
@@ -164,8 +163,19 @@ def not_pdf_to_images_webp_libreoffice(
     # Check if PDF was actually created, even if returncode is non-zero
     # (Java warnings can cause non-zero exit codes even when conversion succeeds)
     if not pdf_candidates:
+        error_msg = result.stderr or result.stdout or "Unknown error"
+        # Check for X11/display errors
+        if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
+            xvfb_available = check_xvfb_available()
+            if not xvfb_available:
+                raise RuntimeError(
+                    f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb' or 'yum install xorg-x11-server-Xvfb'\n"
+                    f"Original error: {error_msg}"
+                )
+            else:
+                raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
         if result.returncode != 0:
-            raise RuntimeError(f"LibreOffice failed: {result.stderr}\n{result.stdout}")
+            raise RuntimeError(f"LibreOffice failed: {error_msg}")
         raise RuntimeError(f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
     
     # If PDF was created but returncode is non-zero, log warning but continue
@@ -304,19 +314,26 @@ def try_repair_office_file(path: str) -> str | None:
         try:
             # Create environment for headless LibreOffice operation
             env = os.environ.copy()
-            # Disable X11/display requirements
             env.pop('DISPLAY', None)
-            env['SAL_DISABLE_OPENCL'] = '1'
             env['SAL_USE_VCLPLUGIN'] = 'gen'
-            # Disable Java
+            env['SAL_DISABLE_OPENCL'] = '1'
             env.pop('JAVA_HOME', None)
             env.pop('JRE_HOME', None)
+            env.pop('JDK_HOME', None)
+            
+            # Build command
+            soffice_cmd = ["soffice", "--headless", "--nologo", "--convert-to", "pptx", path]
+            
+            # Use xvfb-run if available
+            use_xvfb = check_xvfb_available()
+            if use_xvfb:
+                soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
             
             subprocess.run(
-                ["soffice", "--headless", "--nologo", "--convert-to", "pptx", path],
+                soffice_cmd,
                 check=True,
                 timeout=LIBREOFFICE_TIMEOUT,
-                preexec_fn=set_process_limits,
+                preexec_fn=set_process_limits if not use_xvfb else None,
                 env=env
             )
             if os.path.exists(pptx_path):
