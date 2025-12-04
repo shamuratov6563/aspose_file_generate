@@ -74,7 +74,12 @@ def not_pdf_to_images_webp_libreoffice(
         "--convert-to", "pdf",
         "--outdir", abs_output,
         abs_ppt
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+    ], 
+    stdout=subprocess.PIPE, 
+    stderr=subprocess.PIPE, 
+    text=True, 
+    timeout=120
+    )
 
     print("STDOUT:", result.stdout)
     print("STDERR:", result.stderr)
@@ -212,7 +217,7 @@ def try_repair_office_file(path: str) -> str | None:
         try:
             subprocess.run(
                 ["soffice", "--headless", "--convert-to", "pptx", path],
-                check=True
+                check=True, timeout=120
             )
             if os.path.exists(pptx_path):
                 print(f"🌀 Converted old PPT → PPTX: {pptx_path}")
