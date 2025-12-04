@@ -31,7 +31,7 @@ DEFAULT_MAX_PDF_PAGES = 3
 PDF_DPI = 200
 
 # LibreOffice conversion limits (configurable via environment variables)
-LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "180"))  # 10 minutes default
+LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "120"))  # 10 minutes default
 LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "2048"))  # 2GB default
 
 session = requests.Session()
@@ -88,7 +88,7 @@ def check_xvfb_available():
             ["which", "xvfb-run"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=2
+            timeout=120
         )
         return result.returncode == 0
     except Exception:
@@ -596,4 +596,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=500, workers=4)
+    process_doc_poster_generate_queue(limit=100, workers=4)
