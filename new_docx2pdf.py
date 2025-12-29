@@ -153,6 +153,7 @@ def pdf_to_images_webp(
 
 
 def download_file(file_url, save_path):
+    """Download file from S3 (used as fallback when local file doesn't exist)."""
     with session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
         response.raise_for_status()
         with open(save_path, 'wb') as f:
@@ -289,13 +290,35 @@ def generate_docs_for_soff(doc_id):
         )
         data = response.json()
         file_type = data['document']['file_type'].lower()
-        file_url = data['document']['file_url']
-        if not file_url:
-            return True
+        file_url = data['document'].get('file_url')  # Keep file_url for S3 fallback
+        
+        # Ensure file_type has a dot prefix if not present
+        if file_type and not file_type.startswith('.'):
+            file_type = f'.{file_type}'
+        
+        if not file_type:
+            print(f"⚠️ No file_type found for doc_id={doc_id}")
+            return False
+        
+        # Prepare temp path and output folder
         temp_path = f"temp_copy_{doc_id}{file_type}"
         output_folder = f"images_slide_copy_{doc_id}"
-
-        download_file(file_url, temp_path)
+        
+        # Try local file first (cost-effective)
+        # Path format: /root/FileConversionBackend/media/uploaded_files/{doc_id}.{extension}
+        local_file_path = f"/root/FileConversionBackend/media/uploaded_files/{doc_id}{file_type}"
+        
+        if os.path.exists(local_file_path):
+            print(f"📁 Using local file for doc_id={doc_id}: {local_file_path}")
+            # Copy to temp location for processing
+            shutil.copy2(local_file_path, temp_path)
+        elif file_url:
+            # Fallback to S3 if local file doesn't exist
+            print(f"☁️ Local file not found, downloading from S3 for doc_id={doc_id}")
+            download_file(file_url, temp_path)
+        else:
+            print(f"⚠️ No file found locally and no file_url available for doc_id={doc_id}")
+            return False
         repaired = None
         if file_type in ['.pptx', '.ppt', '.doc', '.docx'] and os.path.exists(temp_path):
             try:
