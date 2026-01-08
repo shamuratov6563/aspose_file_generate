@@ -68,11 +68,11 @@ def set_process_limits():
         memory_limit_bytes = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 1024
         # RLIMIT_AS limits the virtual memory address space
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-        
+
         # Set CPU time limit in seconds (soft and hard limit)
         cpu_time_limit = LIBREOFFICE_TIMEOUT
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_time_limit, cpu_time_limit))
-        
+
         # Set data segment size limit (heap memory)
         resource.setrlimit(resource.RLIMIT_DATA, (memory_limit_bytes, memory_limit_bytes))
     except (ValueError, OSError, AttributeError) as e:
@@ -104,7 +104,7 @@ def configure_libreoffice_profile(profile_dir: str):
         # Create config directory structure
         config_dir = os.path.join(profile_dir, "user", "config")
         os.makedirs(config_dir, exist_ok=True)
-        
+
         # Create javasettings file to disable Java
         javasettings_file = os.path.join(config_dir, "javasettings_Linux_x86_64.xml")
         javasettings_content = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -117,10 +117,10 @@ def configure_libreoffice_profile(profile_dir: str):
     </node>
   </node>
 </oor:component-data>'''
-        
+
         with open(javasettings_file, 'w') as f:
             f.write(javasettings_content)
-        
+
         # Create registrymodifications file to disable Java
         registry_dir = os.path.join(profile_dir, "user", "registrymodifications.xcu")
         if not os.path.exists(registry_dir):
@@ -143,21 +143,21 @@ def configure_libreoffice_profile(profile_dir: str):
 
 
 def not_pdf_to_images_webp_libreoffice(
-    ppt_path,
-    output_folder,
-    quality=15,
-    max_width=800,
-    max_slides=DEFAULT_MAX_SLIDES,
+        ppt_path,
+        output_folder,
+        quality=15,
+        max_width=800,
+        max_slides=DEFAULT_MAX_SLIDES,
 ):
     abs_ppt = os.path.abspath(ppt_path)
     abs_output = tempfile.mkdtemp(prefix="libreoffice_out_")
     os.makedirs(output_folder, exist_ok=True)
 
     profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_")
-    
+
     # Configure LibreOffice profile to disable Java
     configure_libreoffice_profile(profile_dir)
-    
+
     # Create environment for headless LibreOffice operation
     env = os.environ.copy()
     # Disable X11/display requirements - unset DISPLAY to prevent X11 errors
@@ -169,7 +169,7 @@ def not_pdf_to_images_webp_libreoffice(
     env.pop('JAVA_HOME', None)
     env.pop('JRE_HOME', None)
     env.pop('JDK_HOME', None)
-    
+
     # Build LibreOffice command
     soffice_cmd = [
         "soffice",
@@ -183,7 +183,7 @@ def not_pdf_to_images_webp_libreoffice(
         "--outdir", abs_output,
         abs_ppt
     ]
-    
+
     # Try using xvfb-run if available to provide virtual display
     use_xvfb = check_xvfb_available()
     if use_xvfb:
@@ -193,7 +193,7 @@ def not_pdf_to_images_webp_libreoffice(
         print("ℹ️ Using xvfb-run for virtual display")
     # If xvfb not available, DISPLAY is unset - LibreOffice should work in headless mode
     # but some versions may still require a display
-    
+
     result = subprocess.run(
         soffice_cmd,
         stdout=subprocess.PIPE,
@@ -209,7 +209,7 @@ def not_pdf_to_images_webp_libreoffice(
 
     # Find any PDF in the output folder
     pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
-    
+
     # Check if PDF was actually created, even if returncode is non-zero
     # (Java warnings can cause non-zero exit codes even when conversion succeeds)
     if not pdf_candidates:
@@ -226,8 +226,9 @@ def not_pdf_to_images_webp_libreoffice(
                 raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
         if result.returncode != 0:
             raise RuntimeError(f"LibreOffice failed: {error_msg}")
-        raise RuntimeError(f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
-    
+        raise RuntimeError(
+            f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
+
     # If PDF was created but returncode is non-zero, log warning but continue
     if result.returncode != 0:
         # Check if stderr only contains Java-related warnings
@@ -269,11 +270,11 @@ def not_pdf_to_images_webp_libreoffice(
 
 
 def pdf_to_images_webp(
-    pdf_path,
-    output_folder,
-    quality=60,
-    max_width=None,
-    max_pages=DEFAULT_MAX_PDF_PAGES,
+        pdf_path,
+        output_folder,
+        quality=60,
+        max_width=None,
+        max_pages=DEFAULT_MAX_PDF_PAGES,
 ):
     os.makedirs(output_folder, exist_ok=True)
     total_pages = get_pdf_page_count(pdf_path)
@@ -290,11 +291,11 @@ def pdf_to_images_webp(
             new_height = int(float(img.height) * ratio)
             img = img.resize((max_width, new_height))
 
-        img_path = os.path.join(output_folder, f"page_{i+1}.webp")
+        img_path = os.path.join(output_folder, f"page_{i + 1}.webp")
         img.save(img_path, "WEBP", quality=quality)
 
     return (
-        [os.path.join(output_folder, f"page_{i+1}.webp") for i in range(len(images))],
+        [os.path.join(output_folder, f"page_{i + 1}.webp") for i in range(len(images))],
         total_pages or len(images),
     )
 
@@ -365,7 +366,7 @@ def try_repair_office_file(path: str) -> str | None:
             # Create temporary profile for this conversion
             temp_profile = tempfile.mkdtemp(prefix="libreoffice_profile_")
             configure_libreoffice_profile(temp_profile)
-            
+
             # Create environment for headless LibreOffice operation
             env = os.environ.copy()
             env.pop('DISPLAY', None)
@@ -374,7 +375,7 @@ def try_repair_office_file(path: str) -> str | None:
             env.pop('JAVA_HOME', None)
             env.pop('JRE_HOME', None)
             env.pop('JDK_HOME', None)
-            
+
             # Build command
             soffice_cmd = [
                 "soffice",
@@ -384,12 +385,12 @@ def try_repair_office_file(path: str) -> str | None:
                 "--convert-to", "pptx",
                 path
             ]
-            
+
             # Use xvfb-run if available
             use_xvfb = check_xvfb_available()
             if use_xvfb:
                 soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
-            
+
             subprocess.run(
                 soffice_cmd,
                 check=True,
@@ -399,7 +400,7 @@ def try_repair_office_file(path: str) -> str | None:
             )
             # Cleanup temp profile
             shutil.rmtree(temp_profile, ignore_errors=True)
-            
+
             if os.path.exists(pptx_path):
                 print(f"🌀 Converted old PPT → PPTX: {pptx_path}")
                 path = pptx_path
@@ -442,7 +443,7 @@ def try_repair_office_file(path: str) -> str | None:
         # Build repaired path
         repaired_path = (
             path.replace(".pptx", "_repaired.pptx")
-                .replace(".docx", "_repaired.docx")
+            .replace(".docx", "_repaired.docx")
         )
 
         base = repaired_path.replace(".pptx", "").replace(".docx", "")
@@ -459,13 +460,11 @@ def try_repair_office_file(path: str) -> str | None:
     except Exception as e:
         print(f"❌ Repair attempt failed for {path}: {e}")
         return None
-    
+
 
 def generate_docs_for_soff(doc_id):
-    print(f"🔄 Processing doc_id={doc_id}")
     temp_path = None
     output_folder = None
-    success = False
     try:
         response = session.get(
             f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/',
@@ -474,35 +473,13 @@ def generate_docs_for_soff(doc_id):
         )
         data = response.json()
         file_type = data['document']['file_type'].lower()
-        file_url = data['document'].get('file_url')  # Keep file_url for S3 fallback
-
-        # Ensure file_type has a dot prefix if not present
-        if file_type and not file_type.startswith('.'):
-            file_type = f'.{file_type}'
-
-        if not file_type:
-            print(f"⚠️ No file_type found for doc_id={doc_id}")
-            return False
-
-        # Prepare temp path and output folder
+        file_url = data['document']['file_url']
+        if not file_url:
+            return True
         temp_path = f"temp_copy_{doc_id}{file_type}"
         output_folder = f"images_slide_copy_{doc_id}"
 
-        # Try local file first (cost-effective)
-        # Path format: /root/FileConversionBackend/media/uploaded_files/{doc_id}.{extension}
-        local_file_path = f"/root/FileConversionBackend/media/uploaded_files/{doc_id}{file_type}"
-
-        if os.path.exists(local_file_path):
-            print(f"📁 Using local file for doc_id={doc_id}: {local_file_path}")
-            # Copy to temp location for processing
-            shutil.copy2(local_file_path, temp_path)
-        elif file_url:
-            # Fallback to S3 if local file doesn't exist
-            print(f"☁️ Local file not found, downloading from S3 for doc_id={doc_id}")
-            download_file(file_url, temp_path)
-        else:
-            print(f"⚠️ No file found locally and no file_url available for doc_id={doc_id}")
-            return False
+        download_file(file_url, temp_path)
         repaired = None
         if file_type in ['.pptx', '.ppt', '.doc', '.docx'] and os.path.exists(temp_path):
             try:
@@ -572,6 +549,8 @@ def generate_docs_for_soff(doc_id):
             shutil.rmtree(output_folder)
 
     return True
+
+
 # ========= Worker & Queue System =========
 
 
@@ -620,4 +599,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=100, workers=4)
+    process_doc_poster_generate_queue(limit=10000, workers=2)
