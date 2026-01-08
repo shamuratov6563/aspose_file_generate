@@ -462,6 +462,7 @@ def try_repair_office_file(path: str) -> str | None:
     
 
 def generate_docs_for_soff(doc_id):
+    print(f"🔄 Processing doc_id={doc_id}")
     temp_path = None
     output_folder = None
     success = False
