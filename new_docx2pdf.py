@@ -31,8 +31,8 @@ DEFAULT_MAX_PDF_PAGES = 3
 PDF_DPI = 200
 
 # LibreOffice conversion limits (configurable via environment variables)
-LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "120"))  # 10 minutes default
-LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "2048"))  # 2GB default
+LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "60"))  # 2 minutes default
+LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "1024"))  # 1GB default
 
 session = requests.Session()
 session.headers.update(headers)
