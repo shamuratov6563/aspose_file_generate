@@ -1,5 +1,6 @@
 import glob
 import os
+import platform
 import resource
 import shlex
 import shutil
@@ -32,7 +33,7 @@ DEFAULT_MAX_PDF_PAGES = 3
 PDF_DPI = 200
 
 # LibreOffice conversion limits (configurable via environment variables)
-LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "60"))  # 2 minutes default
+LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "180"))  # 3 minutes default
 LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "1024"))  # 1GB default
 
 session = requests.Session()
@@ -96,6 +97,115 @@ def check_xvfb_available():
         return False
 
 
+def count_running_libreoffice_processes():
+    """Count how many LibreOffice processes are currently running."""
+    try:
+        ps_output = subprocess.run(
+            ['ps', 'aux'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5
+        )
+        if ps_output.returncode == 0:
+            count = sum(1 for line in ps_output.stdout.split('\n') 
+                       if 'soffice' in line.lower() and 'grep' not in line)
+            return count
+    except Exception:
+        pass
+    return 0
+
+
+def kill_all_libreoffice_processes(profile_dir: str, process_pid: int = None, timeout: int = 10):
+    """
+    Kill ALL LibreOffice processes related to a specific profile directory.
+    This includes soffice.bin, soffice processes, and any child processes.
+    
+    Args:
+        profile_dir: The LibreOffice profile directory to identify related processes
+        process_pid: Optional parent process PID to kill first
+        timeout: Timeout for killing processes
+    """
+    killed_pids = []
+    
+    try:
+        # First, try to kill the parent process if provided
+        if process_pid:
+            try:
+                os.kill(process_pid, 15)  # SIGTERM
+                time.sleep(1)
+                if subprocess.run(['ps', '-p', str(process_pid)], 
+                                 stdout=subprocess.DEVNULL, 
+                                 stderr=subprocess.DEVNULL).returncode == 0:
+                    os.kill(process_pid, 9)  # SIGKILL
+                killed_pids.append(process_pid)
+            except (ProcessLookupError, OSError):
+                pass  # Process already dead
+        
+        # Extract profile name from full path for matching
+        profile_name = os.path.basename(profile_dir)
+        if not profile_name:
+            profile_name = os.path.basename(os.path.dirname(profile_dir))
+        
+        # Find and kill all soffice/soffice.bin processes with this profile
+        try:
+            # Use ps to find processes containing the profile path
+            ps_output = subprocess.run(
+                ['ps', 'aux'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5
+            )
+            
+            if ps_output.returncode == 0:
+                for line in ps_output.stdout.split('\n'):
+                    if profile_name in line and ('soffice' in line or 'Xvfb' in line):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                pid = int(parts[1])
+                                if pid not in killed_pids and pid != os.getpid():
+                                    # Kill the process
+                                    try:
+                                        os.kill(pid, 15)  # SIGTERM first
+                                        killed_pids.append(pid)
+                                    except (ProcessLookupError, OSError):
+                                        pass
+                            except (ValueError, IndexError):
+                                pass
+        except Exception as e:
+            print(f"⚠️  Error finding processes: {e}")
+        
+        # Wait a bit, then force kill any remaining
+        time.sleep(2)
+        for pid in killed_pids:
+            try:
+                if subprocess.run(['ps', '-p', str(pid)], 
+                                stdout=subprocess.DEVNULL, 
+                                stderr=subprocess.DEVNULL).returncode == 0:
+                    os.kill(pid, 9)  # SIGKILL
+            except (ProcessLookupError, OSError):
+                pass
+        
+        # Also use pkill as fallback for any remaining soffice.bin processes
+        try:
+            subprocess.run(
+                ['pkill', '-f', f'libreoffice_profile.*{profile_name}'],
+                timeout=3,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
+        
+        if killed_pids:
+            print(f"🧹 Killed {len(killed_pids)} LibreOffice process(es): {killed_pids}")
+            
+    except Exception as e:
+        print(f"⚠️  Error in kill_all_libreoffice_processes: {e}")
+
+
 def configure_libreoffice_profile(profile_dir: str):
     """
     Configure LibreOffice profile to disable Java and X11 requirements.
@@ -152,10 +262,22 @@ def not_pdf_to_images_webp_libreoffice(
 ):
     file_name = os.path.basename(ppt_path)
     file_size_mb = os.path.getsize(ppt_path) / (1024 * 1024)
-    print(f"\n{'='*80}")
-    print(f"🔄 Starting conversion: {file_name}")
-    print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB | Timeout: {LIBREOFFICE_TIMEOUT}s")
-    print(f"{'='*80}")
+    
+    # Calculate dynamic timeout based on file size (minimum 120s, add 15s per MB)
+    # Large files need more time to convert
+    dynamic_timeout = max(120, LIBREOFFICE_TIMEOUT + int(file_size_mb * 15))
+    if dynamic_timeout > LIBREOFFICE_TIMEOUT:
+        print(f"\n{'='*80}")
+        print(f"🔄 Starting conversion: {file_name}")
+        print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
+        print(f"⏱️  Timeout adjusted: {LIBREOFFICE_TIMEOUT}s → {dynamic_timeout}s (based on file size)")
+        print(f"{'='*80}")
+    else:
+        print(f"\n{'='*80}")
+        print(f"🔄 Starting conversion: {file_name}")
+        print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB | Timeout: {LIBREOFFICE_TIMEOUT}s")
+        print(f"{'='*80}")
+        dynamic_timeout = LIBREOFFICE_TIMEOUT
     
     abs_ppt = os.path.abspath(ppt_path)
     abs_output = tempfile.mkdtemp(prefix="libreoffice_out_")
@@ -196,27 +318,30 @@ def not_pdf_to_images_webp_libreoffice(
         abs_ppt
     ]
 
-    # Try using xvfb-run if available to provide virtual display
-    use_xvfb = check_xvfb_available()
-    
-    # Apply memory limit: use ulimit via shell wrapper when xvfb is used
-    # because preexec_fn doesn't work with xvfb-run
-    memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
-    
-    if use_xvfb:
-        # Wrap command with xvfb-run for virtual display and ulimit for memory
-        # -a: auto-display number, -s: server args, screen 0: virtual screen
-        # Use bash to set ulimit before running the command
-        soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
-        soffice_cmd = [
-            "bash", "-c",
-            f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
-        ]
-        print(f"ℹ️ Using xvfb-run for virtual display with memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
-    # If xvfb not available, DISPLAY is unset - LibreOffice should work in headless mode
-    # but some versions may still require a display
+    # Check if xvfb is needed (only for Linux systems without display)
+    # On macOS, LibreOffice works in headless mode without xvfb
+    use_xvfb = False
+    if platform.system() == 'Linux':
+        # On Linux, xvfb may be needed if no display is available
+        use_xvfb = check_xvfb_available()
+        if use_xvfb:
+            # Wrap command with xvfb-run for virtual display and ulimit for memory
+            # -a: auto-display number, -s: server args, screen 0: virtual screen
+            memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+            soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
+            soffice_cmd = [
+                "bash", "-c",
+                f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+            ]
+            print(f"ℹ️ Using xvfb-run for virtual display with memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
+    # On macOS, LibreOffice works in headless mode without needing xvfb
 
-    print(f"📊 LibreOffice memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB, timeout: {LIBREOFFICE_TIMEOUT}s")
+    # Monitor running LibreOffice processes before starting
+    running_count = count_running_libreoffice_processes()
+    if running_count > 0:
+        print(f"📊 Currently running LibreOffice processes: {running_count}")
+    
+    print(f"📊 LibreOffice memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB, timeout: {dynamic_timeout}s")
     print(f"🚀 Launching LibreOffice process...")
     
     process_start_time = time.time()
@@ -249,39 +374,17 @@ def not_pdf_to_images_webp_libreoffice(
                 last_check = int(elapsed)
             
             # Check for timeout
-            if elapsed > LIBREOFFICE_TIMEOUT:
-                print(f"\n⏱️  TIMEOUT REACHED ({LIBREOFFICE_TIMEOUT}s)")
-                print(f"🔪 Killing LibreOffice process (PID: {process_pid})...")
+            if elapsed > dynamic_timeout:
+                print(f"\n⏱️  TIMEOUT REACHED ({dynamic_timeout}s)")
+                print(f"🔪 Killing ALL LibreOffice processes for profile...")
+                
+                # Use the robust cleanup function to kill all related processes
+                kill_all_libreoffice_processes(profile_dir, process_pid)
                 
                 try:
-                    # Try graceful termination first
-                    process.terminate()
-                    time.sleep(2)
-                    
-                    if process.poll() is None:
-                        print(f"💀 Force killing process (PID: {process_pid})...")
-                        process.kill()
-                        time.sleep(1)
-                    
-                    # Also kill any child processes
-                    try:
-                        subprocess.run(
-                            ['pkill', '-P', str(process_pid)],
-                            timeout=3,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL
-                        )
-                        print(f"🧹 Killed child processes of PID {process_pid}")
-                    except:
-                        pass
-                    
-                    process.wait(timeout=3)
-                    print(f"✅ Process {process_pid} terminated")
-                    
+                    process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    print(f"⚠️  Process {process_pid} did not terminate gracefully")
-                except Exception as e:
-                    print(f"⚠️  Error killing process: {e}")
+                    print(f"⚠️  Process did not terminate within wait timeout")
                 
                 # Clean up temp directories
                 print(f"🧹 Cleaning up temporary directories...")
@@ -292,7 +395,7 @@ def not_pdf_to_images_webp_libreoffice(
                     shutil.rmtree(profile_dir, ignore_errors=True)
                     print(f"🗑️  Deleted: {profile_dir}")
                 
-                raise subprocess.TimeoutExpired("soffice", LIBREOFFICE_TIMEOUT)
+                raise subprocess.TimeoutExpired("soffice", dynamic_timeout)
             
             time.sleep(1)
         
@@ -328,17 +431,23 @@ def not_pdf_to_images_webp_libreoffice(
         })()
         
     except subprocess.TimeoutExpired as e:
-        print(f"\n❌ Conversion failed: Timeout after {LIBREOFFICE_TIMEOUT}s")
+        print(f"\n❌ Conversion failed: Timeout after {dynamic_timeout}s")
+        # Ensure cleanup happens
+        if process_pid:
+            kill_all_libreoffice_processes(profile_dir, process_pid)
         raise
     except Exception as e:
         if process and process.poll() is None:
             print(f"\n⚠️  Exception occurred, cleaning up process (PID: {process_pid})...")
+            kill_all_libreoffice_processes(profile_dir, process_pid)
+        raise
+    finally:
+        # Always ensure cleanup of any remaining processes
+        if process_pid and process and process.poll() is None:
             try:
-                process.kill()
-                process.wait(timeout=3)
+                kill_all_libreoffice_processes(profile_dir, process_pid)
             except:
                 pass
-        raise
 
     # Find any PDF in the output folder
     print(f"\n📋 Searching for generated PDF in: {abs_output}")
@@ -446,7 +555,13 @@ def not_pdf_to_images_webp_libreoffice(
         saved_paths.append(webp_path)
         print(f"   ✅ Saved: slide_{i}.webp ({webp_size:.1f}KB, quality={img_quality})")
 
-    print(f"\n🧹 Cleaning up temporary files...")
+    print(f"\n🧹 Cleaning up temporary files and processes...")
+    # Ensure all LibreOffice processes are killed even after successful completion
+    if process_pid:
+        try:
+            kill_all_libreoffice_processes(profile_dir, process_pid)
+        except:
+            pass
     if os.path.exists(abs_output):
         shutil.rmtree(abs_output, ignore_errors=True)
         print(f"🗑️  Deleted temporary output directory: {abs_output}")
@@ -579,25 +694,41 @@ def try_repair_office_file(path: str) -> str | None:
                 path
             ]
 
-            # Use xvfb-run if available with memory limit
-            use_xvfb = check_xvfb_available()
-            memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
-            
-            if use_xvfb:
-                # Apply memory limit with xvfb via ulimit
-                soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
-                soffice_cmd = [
-                    "bash", "-c",
-                    f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
-                ]
+            # Use xvfb-run only on Linux if available (not needed on macOS)
+            use_xvfb = False
+            if platform.system() == 'Linux':
+                use_xvfb = check_xvfb_available()
+                if use_xvfb:
+                    # Apply memory limit with xvfb via ulimit
+                    memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+                    soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
+                    soffice_cmd = [
+                        "bash", "-c",
+                        f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+                    ]
 
-            subprocess.run(
-                soffice_cmd,
-                check=True,
-                timeout=LIBREOFFICE_TIMEOUT,
-                preexec_fn=set_process_limits if not use_xvfb else None,
-                env=env
-            )
+            process = None
+            try:
+                process = subprocess.run(
+                    soffice_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=LIBREOFFICE_TIMEOUT,
+                    preexec_fn=set_process_limits if not use_xvfb else None,
+                    env=env
+                )
+                if process.returncode != 0:
+                    raise subprocess.CalledProcessError(process.returncode, soffice_cmd, stderr=process.stderr)
+            except subprocess.TimeoutExpired:
+                # If timeout, kill all related processes
+                kill_all_libreoffice_processes(temp_profile)
+                raise
+            except Exception:
+                # On any error, try to cleanup processes
+                if process and hasattr(process, 'pid'):
+                    kill_all_libreoffice_processes(temp_profile, process.pid)
+                raise
             # Cleanup temp profile
             shutil.rmtree(temp_profile, ignore_errors=True)
 
