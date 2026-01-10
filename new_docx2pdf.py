@@ -1,6 +1,7 @@
 import glob
 import os
 import resource
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -143,19 +144,30 @@ def configure_libreoffice_profile(profile_dir: str):
 
 
 def not_pdf_to_images_webp_libreoffice(
-        ppt_path,
-        output_folder,
-        quality=15,
-        max_width=800,
-        max_slides=DEFAULT_MAX_SLIDES,
+    ppt_path,
+    output_folder,
+    quality=15,
+    max_width=800,
+    max_slides=DEFAULT_MAX_SLIDES,
 ):
+    file_name = os.path.basename(ppt_path)
+    file_size_mb = os.path.getsize(ppt_path) / (1024 * 1024)
+    print(f"\n{'='*80}")
+    print(f"🔄 Starting conversion: {file_name}")
+    print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB | Timeout: {LIBREOFFICE_TIMEOUT}s")
+    print(f"{'='*80}")
+    
     abs_ppt = os.path.abspath(ppt_path)
     abs_output = tempfile.mkdtemp(prefix="libreoffice_out_")
     os.makedirs(output_folder, exist_ok=True)
+    print(f"📁 Created output directory: {abs_output}")
+    print(f"📁 Created image folder: {output_folder}")
 
     profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_")
+    print(f"📁 Created LibreOffice profile: {profile_dir}")
 
     # Configure LibreOffice profile to disable Java
+    print(f"⚙️  Configuring LibreOffice profile...")
     configure_libreoffice_profile(profile_dir)
 
     # Create environment for headless LibreOffice operation
@@ -186,46 +198,202 @@ def not_pdf_to_images_webp_libreoffice(
 
     # Try using xvfb-run if available to provide virtual display
     use_xvfb = check_xvfb_available()
+    
+    # Apply memory limit: use ulimit via shell wrapper when xvfb is used
+    # because preexec_fn doesn't work with xvfb-run
+    memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+    
     if use_xvfb:
-        # Wrap command with xvfb-run for virtual display
+        # Wrap command with xvfb-run for virtual display and ulimit for memory
         # -a: auto-display number, -s: server args, screen 0: virtual screen
-        soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
-        print("ℹ️ Using xvfb-run for virtual display")
+        # Use bash to set ulimit before running the command
+        soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
+        soffice_cmd = [
+            "bash", "-c",
+            f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+        ]
+        print(f"ℹ️ Using xvfb-run for virtual display with memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
     # If xvfb not available, DISPLAY is unset - LibreOffice should work in headless mode
     # but some versions may still require a display
 
-    result = subprocess.run(
-        soffice_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=LIBREOFFICE_TIMEOUT,
-        preexec_fn=set_process_limits if not use_xvfb else None,  # xvfb-run handles its own process
-        env=env
-    )
-
-    print("STDOUT:", result.stdout)
-    print("STDERR:", result.stderr)
+    print(f"📊 LibreOffice memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB, timeout: {LIBREOFFICE_TIMEOUT}s")
+    print(f"🚀 Launching LibreOffice process...")
+    
+    process_start_time = time.time()
+    process = None
+    process_pid = None
+    
+    try:
+        # Use Popen to monitor process in real-time
+        process = subprocess.Popen(
+            soffice_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=set_process_limits if not use_xvfb else None,
+            env=env
+        )
+        process_pid = process.pid
+        print(f"✅ LibreOffice process started | PID: {process_pid}")
+        
+        # Monitor process with periodic updates
+        check_interval = 5  # Check every 5 seconds
+        last_check = 0
+        
+        while process.poll() is None:
+            elapsed = time.time() - process_start_time
+            
+            # Print progress every check_interval seconds
+            if int(elapsed) >= last_check + check_interval:
+                print(f"⏳ Processing... ({int(elapsed)}s elapsed)")
+                last_check = int(elapsed)
+            
+            # Check for timeout
+            if elapsed > LIBREOFFICE_TIMEOUT:
+                print(f"\n⏱️  TIMEOUT REACHED ({LIBREOFFICE_TIMEOUT}s)")
+                print(f"🔪 Killing LibreOffice process (PID: {process_pid})...")
+                
+                try:
+                    # Try graceful termination first
+                    process.terminate()
+                    time.sleep(2)
+                    
+                    if process.poll() is None:
+                        print(f"💀 Force killing process (PID: {process_pid})...")
+                        process.kill()
+                        time.sleep(1)
+                    
+                    # Also kill any child processes
+                    try:
+                        subprocess.run(
+                            ['pkill', '-P', str(process_pid)],
+                            timeout=3,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        print(f"🧹 Killed child processes of PID {process_pid}")
+                    except:
+                        pass
+                    
+                    process.wait(timeout=3)
+                    print(f"✅ Process {process_pid} terminated")
+                    
+                except subprocess.TimeoutExpired:
+                    print(f"⚠️  Process {process_pid} did not terminate gracefully")
+                except Exception as e:
+                    print(f"⚠️  Error killing process: {e}")
+                
+                # Clean up temp directories
+                print(f"🧹 Cleaning up temporary directories...")
+                if os.path.exists(abs_output):
+                    shutil.rmtree(abs_output, ignore_errors=True)
+                    print(f"🗑️  Deleted: {abs_output}")
+                if os.path.exists(profile_dir):
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    print(f"🗑️  Deleted: {profile_dir}")
+                
+                raise subprocess.TimeoutExpired("soffice", LIBREOFFICE_TIMEOUT)
+            
+            time.sleep(1)
+        
+        # Process completed
+        elapsed_total = time.time() - process_start_time
+        print(f"✅ Process completed in {elapsed_total:.1f}s | Exit code: {process.returncode}")
+        
+        # Get stdout and stderr
+        stdout, stderr = process.communicate()
+        
+        if stdout:
+            print(f"📤 STDOUT: {stdout[:500]}{'...' if len(stdout) > 500 else ''}")
+        if stderr:
+            print(f"📤 STDERR: {stderr[:500]}{'...' if len(stderr) > 500 else ''}")
+        
+        # Check for memory limit violations (signal 9 = SIGKILL, signal 11 = SIGSEGV)
+        if process.returncode == -9 or (stderr and ('Killed' in stderr or 'SIGKILL' in stderr)):
+            print(f"\n⚠️  MEMORY LIMIT VIOLATION DETECTED!")
+            print(f"💀 Process was killed due to exceeding {LIBREOFFICE_MEMORY_LIMIT_MB}MB memory limit")
+            print(f"🧹 Cleaning up temporary files...")
+            if os.path.exists(abs_output):
+                shutil.rmtree(abs_output, ignore_errors=True)
+                print(f"🗑️  Deleted: {abs_output}")
+            if os.path.exists(profile_dir):
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                print(f"🗑️  Deleted: {profile_dir}")
+            raise RuntimeError(f"LibreOffice exceeded memory limit ({LIBREOFFICE_MEMORY_LIMIT_MB}MB) and was killed")
+        
+        result = type('Result', (), {
+            'returncode': process.returncode,
+            'stdout': stdout,
+            'stderr': stderr
+        })()
+        
+    except subprocess.TimeoutExpired as e:
+        print(f"\n❌ Conversion failed: Timeout after {LIBREOFFICE_TIMEOUT}s")
+        raise
+    except Exception as e:
+        if process and process.poll() is None:
+            print(f"\n⚠️  Exception occurred, cleaning up process (PID: {process_pid})...")
+            try:
+                process.kill()
+                process.wait(timeout=3)
+            except:
+                pass
+        raise
 
     # Find any PDF in the output folder
+    print(f"\n📋 Searching for generated PDF in: {abs_output}")
     pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
+    
+    if pdf_candidates:
+        print(f"✅ Found {len(pdf_candidates)} PDF file(s)")
+        for pdf in pdf_candidates:
+            pdf_size = os.path.getsize(pdf) / (1024 * 1024)
+            print(f"   📄 {os.path.basename(pdf)} ({pdf_size:.2f}MB)")
 
     # Check if PDF was actually created, even if returncode is non-zero
     # (Java warnings can cause non-zero exit codes even when conversion succeeds)
     if not pdf_candidates:
         error_msg = result.stderr or result.stdout or "Unknown error"
+        print(f"\n❌ No PDF file generated!")
+        print(f"🧹 Cleaning up temporary directories...")
+        
         # Check for X11/display errors
         if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
             xvfb_available = check_xvfb_available()
             if not xvfb_available:
+                if os.path.exists(abs_output):
+                    shutil.rmtree(abs_output, ignore_errors=True)
+                    print(f"🗑️  Deleted: {abs_output}")
+                if os.path.exists(profile_dir):
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    print(f"🗑️  Deleted: {profile_dir}")
                 raise RuntimeError(
                     f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb' or 'yum install xorg-x11-server-Xvfb'\n"
                     f"Original error: {error_msg}"
                 )
             else:
+                if os.path.exists(abs_output):
+                    shutil.rmtree(abs_output, ignore_errors=True)
+                    print(f"🗑️  Deleted: {abs_output}")
+                if os.path.exists(profile_dir):
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    print(f"🗑️  Deleted: {profile_dir}")
                 raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
         if result.returncode != 0:
+            if os.path.exists(abs_output):
+                shutil.rmtree(abs_output, ignore_errors=True)
+                print(f"🗑️  Deleted: {abs_output}")
+            if os.path.exists(profile_dir):
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                print(f"🗑️  Deleted: {profile_dir}")
             raise RuntimeError(f"LibreOffice failed: {error_msg}")
+        
+        if os.path.exists(abs_output):
+            shutil.rmtree(abs_output, ignore_errors=True)
+            print(f"🗑️  Deleted: {abs_output}")
+        if os.path.exists(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            print(f"🗑️  Deleted: {profile_dir}")
         raise RuntimeError(
             f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
 
@@ -235,46 +403,71 @@ def not_pdf_to_images_webp_libreoffice(
         stderr_lower = result.stderr.lower()
         java_warnings = ['java', 'javaldx', 'jvm', 'java runtime environment']
         if any(warning in stderr_lower for warning in java_warnings):
-            print(f"⚠️ LibreOffice completed conversion but reported Java warnings (PDF was created): {result.stderr}")
+            print(f"⚠️  LibreOffice completed conversion but reported Java warnings (PDF was created)")
         else:
             # Non-Java error, but PDF exists - log warning but proceed
-            print(f"⚠️ LibreOffice returned non-zero exit code but PDF was created: {result.stderr}")
+            print(f"⚠️  LibreOffice returned non-zero exit code ({result.returncode}) but PDF was created")
 
     pdf_path = pdf_candidates[0]  # pick first PDF
-    print(f"📄 Using generated PDF: {pdf_path}")
+    pdf_size = os.path.getsize(pdf_path) / (1024 * 1024)
+    print(f"\n📄 Using generated PDF: {os.path.basename(pdf_path)} ({pdf_size:.2f}MB)")
 
+    print(f"📊 Extracting page information...")
     total_pages = get_pdf_page_count(pdf_path)
+    if total_pages:
+        print(f"✅ PDF has {total_pages} pages")
+    else:
+        print(f"⚠️  Could not determine page count, will extract first {max_slides} pages")
+    
+    print(f"🖼️  Converting PDF pages to images (max {max_slides} pages)...")
     pages = convert_from_path(
         pdf_path,
         dpi=PDF_DPI,
         first_page=1,
         last_page=max_slides,
     )
+    print(f"✅ Extracted {len(pages)} page(s)")
+    
     saved_paths = []
+    print(f"💾 Saving images as WebP...")
 
     for i, pil_img in enumerate(pages, start=1):
+        original_size = (pil_img.width, pil_img.height)
         if pil_img.width > max_width:
             ratio = max_width / pil_img.width
             new_height = int(pil_img.height * ratio)
             pil_img = pil_img.resize((max_width, new_height), Image.LANCZOS)
+            print(f"   📐 Page {i}: Resized {original_size[0]}x{original_size[1]} → {max_width}x{new_height}")
 
         webp_path = os.path.join(output_folder, f"slide_{i}.webp")
-        pil_img.convert("RGB").save(webp_path, "webp", quality=quality if i == 1 else 5, method=6)
+        img_quality = quality if i == 1 else 5
+        pil_img.convert("RGB").save(webp_path, "webp", quality=img_quality, method=6)
+        webp_size = os.path.getsize(webp_path) / 1024
         saved_paths.append(webp_path)
+        print(f"   ✅ Saved: slide_{i}.webp ({webp_size:.1f}KB, quality={img_quality})")
 
-    # Cleanup
-    shutil.rmtree(abs_output, ignore_errors=True)
-    shutil.rmtree(profile_dir, ignore_errors=True)
+    print(f"\n🧹 Cleaning up temporary files...")
+    if os.path.exists(abs_output):
+        shutil.rmtree(abs_output, ignore_errors=True)
+        print(f"🗑️  Deleted temporary output directory: {abs_output}")
+    if os.path.exists(profile_dir):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        print(f"🗑️  Deleted LibreOffice profile: {profile_dir}")
+    
+    print(f"\n{'='*80}")
+    print(f"✅ Conversion completed: {file_name}")
+    print(f"📊 Result: {len(saved_paths)} images generated | Total pages: {total_pages or len(pages)}")
+    print(f"{'='*80}\n")
 
     return saved_paths, total_pages or len(pages)
 
 
 def pdf_to_images_webp(
-        pdf_path,
-        output_folder,
-        quality=60,
-        max_width=None,
-        max_pages=DEFAULT_MAX_PDF_PAGES,
+    pdf_path,
+    output_folder,
+    quality=60,
+    max_width=None,
+    max_pages=DEFAULT_MAX_PDF_PAGES,
 ):
     os.makedirs(output_folder, exist_ok=True)
     total_pages = get_pdf_page_count(pdf_path)
@@ -386,10 +579,17 @@ def try_repair_office_file(path: str) -> str | None:
                 path
             ]
 
-            # Use xvfb-run if available
+            # Use xvfb-run if available with memory limit
             use_xvfb = check_xvfb_available()
+            memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+            
             if use_xvfb:
-                soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
+                # Apply memory limit with xvfb via ulimit
+                soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
+                soffice_cmd = [
+                    "bash", "-c",
+                    f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+                ]
 
             subprocess.run(
                 soffice_cmd,
@@ -443,7 +643,7 @@ def try_repair_office_file(path: str) -> str | None:
         # Build repaired path
         repaired_path = (
             path.replace(".pptx", "_repaired.pptx")
-            .replace(".docx", "_repaired.docx")
+                .replace(".docx", "_repaired.docx")
         )
 
         base = repaired_path.replace(".pptx", "").replace(".docx", "")
@@ -460,12 +660,16 @@ def try_repair_office_file(path: str) -> str | None:
     except Exception as e:
         print(f"❌ Repair attempt failed for {path}: {e}")
         return None
-
+    
 
 def generate_docs_for_soff(doc_id):
     temp_path = None
     output_folder = None
     try:
+        print(f"\n{'#'*80}")
+        print(f"🆔 Processing document ID: {doc_id}")
+        print(f"{'#'*80}")
+        
         response = session.get(
             f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/',
             stream=True,
@@ -475,11 +679,18 @@ def generate_docs_for_soff(doc_id):
         file_type = data['document']['file_type'].lower()
         file_url = data['document']['file_url']
         if not file_url:
+            print(f"⚠️  No file URL found for doc_id={doc_id}, skipping")
             return True
         temp_path = f"temp_copy_{doc_id}{file_type}"
         output_folder = f"images_slide_copy_{doc_id}"
 
+        print(f"📥 Downloading file from: {file_url}")
+        print(f"💾 Saving to: {temp_path}")
+        download_start = time.time()
         download_file(file_url, temp_path)
+        download_time = time.time() - download_start
+        file_size = os.path.getsize(temp_path) / (1024 * 1024)
+        print(f"✅ Download completed in {download_time:.1f}s | File size: {file_size:.2f}MB")
         repaired = None
         if file_type in ['.pptx', '.ppt', '.doc', '.docx'] and os.path.exists(temp_path):
             try:
@@ -491,23 +702,51 @@ def generate_docs_for_soff(doc_id):
                 )
 
             except Exception as e:
-                print(f"⚠️ LibreOffice failed on {temp_path}: {e}")
+                print(f"\n❌ LibreOffice failed on {temp_path}: {e}")
+                print(f"🔧 Attempting to repair file...")
                 repaired = try_repair_office_file(temp_path)
                 if repaired:
-                    image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
-                        repaired,
-                        output_folder,
-                        quality=60,
-                        max_width=800,
-                    )
+                    print(f"✅ File repaired: {repaired}")
+                    print(f"🔄 Retrying conversion with repaired file...")
+                    try:
+                        image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
+                            repaired,
+                            output_folder,
+                            quality=60,
+                            max_width=800,
+                        )
+                        print(f"✅ Successfully processed repaired file: {len(image_paths)} image(s)")
+                    except Exception as e2:
+                        print(f"❌ Repair attempt also failed: {e2}")
+                        print(f"🗑️  Cleaning up files...")
+                        if os.path.exists(repaired):
+                            os.remove(repaired)
+                            print(f"   🗑️  Deleted: {repaired}")
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                            print(f"   🗑️  Deleted: {temp_path}")
+                        if os.path.exists(output_folder):
+                            shutil.rmtree(output_folder, ignore_errors=True)
+                            print(f"   🗑️  Deleted: {output_folder}")
+                            return False
                 else:
-                    print(f"❌ Skipping doc_id={doc_id}, corrupted file.")
-                    return False
+                    print(f"❌ Could not repair file, skipping doc_id={doc_id}")
+                    print(f"🗑️  Cleaning up files...")
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                        print(f"   🗑️  Deleted: {temp_path}")
+                    if os.path.exists(output_folder):
+                        shutil.rmtree(output_folder, ignore_errors=True)
+                        print(f"   🗑️  Deleted: {output_folder}")
+                        return False
             finally:
+                print(f"\n🧹 Final cleanup of temporary files...")
                 if repaired and os.path.exists(repaired):
                     os.remove(repaired)
+                    print(f"🗑️  Deleted repaired file: {repaired}")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
+                    print(f"🗑️  Deleted original file: {temp_path}")
 
         elif file_type == '.pdf':
             image_paths, pages_count = pdf_to_images_webp(
@@ -519,9 +758,13 @@ def generate_docs_for_soff(doc_id):
             return True
 
         # Upload images back
+        print(f"\n📤 Uploading {len(image_paths)} image(s) to server...")
+        upload_start = time.time()
         with ExitStack() as stack:
             files = []
             for path in image_paths:
+                file_size = os.path.getsize(path) / 1024
+                print(f"   📤 Uploading: {os.path.basename(path)} ({file_size:.1f}KB)")
                 file_handle = stack.enter_context(open(path, "rb"))
                 files.append((
                     "images",
@@ -529,6 +772,7 @@ def generate_docs_for_soff(doc_id):
                 ))
 
             data = {'page_count': pages_count}
+            print(f"   📊 Page count: {pages_count}")
 
             session.patch(
                 f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
@@ -536,17 +780,35 @@ def generate_docs_for_soff(doc_id):
                 data=data,
                 timeout=REQUEST_TIMEOUT,
             )
-        print(f"✅ Finished doc_id={doc_id}")
+        upload_time = time.time() - upload_start
+        print(f"✅ Upload completed in {upload_time:.1f}s")
+        
+        # Clean up image folder
+        if os.path.exists(output_folder):
+            print(f"🧹 Cleaning up image folder: {output_folder}")
+            shutil.rmtree(output_folder, ignore_errors=True)
+            print(f"🗑️  Deleted: {output_folder}")
+        
+        print(f"\n{'='*80}")
+        print(f"✅ COMPLETED doc_id={doc_id}")
+        print(f"{'='*80}\n")
 
     except Exception as e:
-        print(f"❌ Error doc_id={doc_id}: {e}")
+        print(f"\n{'='*80}")
+        print(f"❌ ERROR processing doc_id={doc_id}: {e}")
+        print(f"{'='*80}")
+        import traceback
+        print(f"Traceback:\n{traceback.format_exc()}")
 
     finally:
         # Cleanup temp files
+        print(f"\n🧹 Final cleanup for doc_id={doc_id}...")
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+            print(f"🗑️  Deleted temp file: {temp_path}")
         if output_folder and os.path.exists(output_folder):
-            shutil.rmtree(output_folder)
+            shutil.rmtree(output_folder, ignore_errors=True)
+            print(f"🗑️  Deleted output folder: {output_folder}")
 
     return True
 
@@ -571,7 +833,7 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
     for p in processes:
         p.start()
 
-    start = 1
+    start = 895745
 
     for _ in range(limit):
         endpoint = f"{BASE_URL}/api/v1/seller/moderation-change/?type=true"
@@ -599,4 +861,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=10000, workers=2)
+    process_doc_poster_generate_queue(limit=10000, workers=1)
