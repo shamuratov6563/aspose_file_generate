@@ -24,6 +24,10 @@ load_dotenv()  # This loads variables from a .env file in the current directory
 TOKEN = os.getenv("TOKEN")
 BASE_URL = os.getenv("BASE_URL")
 
+# Define a local temporary directory to bypass Snap sandboxing which often prevents access to system /tmp
+LOCAL_TMP_DIR = os.path.join(os.getcwd(), 'tmp_libreoffice')
+os.makedirs(LOCAL_TMP_DIR, exist_ok=True)
+
 headers = {'Authorization': f"Bearer {TOKEN}"}
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
@@ -280,12 +284,12 @@ def not_pdf_to_images_webp_libreoffice(
         dynamic_timeout = LIBREOFFICE_TIMEOUT
     
     abs_ppt = os.path.abspath(ppt_path)
-    abs_output = tempfile.mkdtemp(prefix="libreoffice_out_")
+    abs_output = tempfile.mkdtemp(prefix="libreoffice_out_", dir=LOCAL_TMP_DIR)
     os.makedirs(output_folder, exist_ok=True)
     print(f"📁 Created output directory: {abs_output}")
     print(f"📁 Created image folder: {output_folder}")
 
-    profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_")
+    profile_dir = tempfile.mkdtemp(prefix="libreoffice_profile_", dir=LOCAL_TMP_DIR)
     print(f"📁 Created LibreOffice profile: {profile_dir}")
 
     # Configure LibreOffice profile to disable Java
@@ -675,8 +679,8 @@ def try_repair_office_file(path: str) -> str | None:
     if path.lower().endswith(".ppt") and not path.lower().endswith(".pptx"):
         pptx_path = path.replace(".ppt", ".pptx")
         try:
-            # Create temporary profile for this conversion
-            temp_profile = tempfile.mkdtemp(prefix="libreoffice_profile_")
+            # Create temporary profile for this conversion using local temp dir
+            temp_profile = tempfile.mkdtemp(prefix="libreoffice_profile_", dir=LOCAL_TMP_DIR)
             configure_libreoffice_profile(temp_profile)
 
             # Create environment for headless LibreOffice operation
@@ -756,7 +760,7 @@ def try_repair_office_file(path: str) -> str | None:
 
     missing_files = []
     try:
-        temp_dir = tempfile.mkdtemp(prefix="repair_office_")
+        temp_dir = tempfile.mkdtemp(prefix="repair_office_", dir=LOCAL_TMP_DIR)
 
         with zipfile.ZipFile(path, 'r') as zip_ref:
             for file in zip_ref.namelist():
