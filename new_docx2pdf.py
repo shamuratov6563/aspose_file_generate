@@ -34,7 +34,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 DOWNLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB chunks for large files
 DEFAULT_MAX_SLIDES = 4
 DEFAULT_MAX_PDF_PAGES = 3
-PDF_DPI = 200
+PDF_DPI = 300
 
 # LibreOffice conversion limits (configurable via environment variables)
 LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "180"))  # 3 minutes default
@@ -457,125 +457,127 @@ def not_pdf_to_images_webp_libreoffice(
             except:
                 pass
 
-    # Find any PDF in the output folder
-    print(f"\n📋 Searching for generated PDF in: {abs_output}")
-    pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
-    
-    if pdf_candidates:
-        print(f"✅ Found {len(pdf_candidates)} PDF file(s)")
-        for pdf in pdf_candidates:
-            pdf_size = os.path.getsize(pdf) / (1024 * 1024)
-            print(f"   📄 {os.path.basename(pdf)} ({pdf_size:.2f}MB)")
-
-    # Check if PDF was actually created, even if returncode is non-zero
-    # (Java warnings can cause non-zero exit codes even when conversion succeeds)
-    if not pdf_candidates:
-        error_msg = result.stderr or result.stdout or "Unknown error"
-        print(f"\n❌ No PDF file generated!")
-        print(f"🧹 Cleaning up temporary directories...")
+    try:
+        # Find any PDF in the output folder
+        print(f"\n📋 Searching for generated PDF in: {abs_output}")
+        pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
         
-        # Check for X11/display errors
-        if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
-            xvfb_available = check_xvfb_available()
-            if not xvfb_available:
+        if pdf_candidates:
+            print(f"✅ Found {len(pdf_candidates)} PDF file(s)")
+            for pdf in pdf_candidates:
+                pdf_size = os.path.getsize(pdf) / (1024 * 1024)
+                print(f"   📄 {os.path.basename(pdf)} ({pdf_size:.2f}MB)")
+
+        # Check if PDF was actually created, even if returncode is non-zero
+        # (Java warnings can cause non-zero exit codes even when conversion succeeds)
+        if not pdf_candidates:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            print(f"\n❌ No PDF file generated!")
+            print(f"🧹 Cleaning up temporary directories...")
+            
+            # Check for X11/display errors
+            if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
+                xvfb_available = check_xvfb_available()
+                if not xvfb_available:
+                    if os.path.exists(abs_output):
+                        shutil.rmtree(abs_output, ignore_errors=True)
+                        print(f"🗑️  Deleted: {abs_output}")
+                    if os.path.exists(profile_dir):
+                        shutil.rmtree(profile_dir, ignore_errors=True)
+                        print(f"🗑️  Deleted: {profile_dir}")
+                    raise RuntimeError(
+                        f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb' or 'yum install xorg-x11-server-Xvfb'\n"
+                        f"Original error: {error_msg}"
+                    )
+                else:
+                    if os.path.exists(abs_output):
+                        shutil.rmtree(abs_output, ignore_errors=True)
+                        print(f"🗑️  Deleted: {abs_output}")
+                    if os.path.exists(profile_dir):
+                        shutil.rmtree(profile_dir, ignore_errors=True)
+                        print(f"🗑️  Deleted: {profile_dir}")
+                    raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
+            if result.returncode != 0:
                 if os.path.exists(abs_output):
                     shutil.rmtree(abs_output, ignore_errors=True)
                     print(f"🗑️  Deleted: {abs_output}")
                 if os.path.exists(profile_dir):
                     shutil.rmtree(profile_dir, ignore_errors=True)
                     print(f"🗑️  Deleted: {profile_dir}")
-                raise RuntimeError(
-                    f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb' or 'yum install xorg-x11-server-Xvfb'\n"
-                    f"Original error: {error_msg}"
-                )
-            else:
-                if os.path.exists(abs_output):
-                    shutil.rmtree(abs_output, ignore_errors=True)
-                    print(f"🗑️  Deleted: {abs_output}")
-                if os.path.exists(profile_dir):
-                    shutil.rmtree(profile_dir, ignore_errors=True)
-                    print(f"🗑️  Deleted: {profile_dir}")
-                raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
-        if result.returncode != 0:
+                raise RuntimeError(f"LibreOffice failed: {error_msg}")
+            
             if os.path.exists(abs_output):
                 shutil.rmtree(abs_output, ignore_errors=True)
                 print(f"🗑️  Deleted: {abs_output}")
             if os.path.exists(profile_dir):
                 shutil.rmtree(profile_dir, ignore_errors=True)
                 print(f"🗑️  Deleted: {profile_dir}")
-            raise RuntimeError(f"LibreOffice failed: {error_msg}")
+            raise RuntimeError(
+                f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
+
+        # If PDF was created but returncode is non-zero, log warning but continue
+        if result.returncode != 0:
+            # Check if stderr only contains Java-related warnings
+            stderr_lower = result.stderr.lower()
+            java_warnings = ['java', 'javaldx', 'jvm', 'java runtime environment']
+            if any(warning in stderr_lower for warning in java_warnings):
+                print(f"⚠️  LibreOffice completed conversion but reported Java warnings (PDF was created)")
+            else:
+                # Non-Java error, but PDF exists - log warning but proceed
+                print(f"⚠️  LibreOffice returned non-zero exit code ({result.returncode}) but PDF was created")
+
+        pdf_path = pdf_candidates[0]  # pick first PDF
+        pdf_size = os.path.getsize(pdf_path) / (1024 * 1024)
+        print(f"\n📄 Using generated PDF: {os.path.basename(pdf_path)} ({pdf_size:.2f}MB)")
+
+        print(f"📊 Extracting page information...")
+        total_pages = get_pdf_page_count(pdf_path)
+        if total_pages:
+            print(f"✅ PDF has {total_pages} pages")
+        else:
+            print(f"⚠️  Could not determine page count, will extract first {max_slides} pages")
         
+        print(f"🖼️  Converting PDF pages to images (max {max_slides} pages)...")
+        pages = convert_from_path(
+            pdf_path,
+            dpi=PDF_DPI,
+            first_page=1,
+            last_page=max_slides,
+        )
+        print(f"✅ Extracted {len(pages)} page(s)")
+        
+        saved_paths = []
+        print(f"💾 Saving images as WebP...")
+
+        for i, pil_img in enumerate(pages, start=1):
+            original_size = (pil_img.width, pil_img.height)
+            if pil_img.width > max_width:
+                ratio = max_width / pil_img.width
+                new_height = int(pil_img.height * ratio)
+                pil_img = pil_img.resize((max_width, new_height), Image.LANCZOS)
+                print(f"   📐 Page {i}: Resized {original_size[0]}x{original_size[1]} → {max_width}x{new_height}")
+
+            webp_path = os.path.join(output_folder, f"slide_{i}.webp")
+            img_quality = quality if i == 1 else 5
+            pil_img.convert("RGB").save(webp_path, "webp", quality=img_quality, method=6)
+            webp_size = os.path.getsize(webp_path) / 1024
+            saved_paths.append(webp_path)
+            print(f"   ✅ Saved: slide_{i}.webp ({webp_size:.1f}KB, quality={img_quality})")
+
+    finally:
+        print(f"\n🧹 Cleaning up temporary files and processes...")
+        # Ensure all LibreOffice processes are killed even after successful completion
+        if process_pid:
+            try:
+                kill_all_libreoffice_processes(profile_dir, process_pid)
+            except:
+                pass
         if os.path.exists(abs_output):
             shutil.rmtree(abs_output, ignore_errors=True)
-            print(f"🗑️  Deleted: {abs_output}")
+            print(f"🗑️  Deleted temporary output directory: {abs_output}")
         if os.path.exists(profile_dir):
             shutil.rmtree(profile_dir, ignore_errors=True)
-            print(f"🗑️  Deleted: {profile_dir}")
-        raise RuntimeError(
-            f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
-
-    # If PDF was created but returncode is non-zero, log warning but continue
-    if result.returncode != 0:
-        # Check if stderr only contains Java-related warnings
-        stderr_lower = result.stderr.lower()
-        java_warnings = ['java', 'javaldx', 'jvm', 'java runtime environment']
-        if any(warning in stderr_lower for warning in java_warnings):
-            print(f"⚠️  LibreOffice completed conversion but reported Java warnings (PDF was created)")
-        else:
-            # Non-Java error, but PDF exists - log warning but proceed
-            print(f"⚠️  LibreOffice returned non-zero exit code ({result.returncode}) but PDF was created")
-
-    pdf_path = pdf_candidates[0]  # pick first PDF
-    pdf_size = os.path.getsize(pdf_path) / (1024 * 1024)
-    print(f"\n📄 Using generated PDF: {os.path.basename(pdf_path)} ({pdf_size:.2f}MB)")
-
-    print(f"📊 Extracting page information...")
-    total_pages = get_pdf_page_count(pdf_path)
-    if total_pages:
-        print(f"✅ PDF has {total_pages} pages")
-    else:
-        print(f"⚠️  Could not determine page count, will extract first {max_slides} pages")
-    
-    print(f"🖼️  Converting PDF pages to images (max {max_slides} pages)...")
-    pages = convert_from_path(
-        pdf_path,
-        dpi=PDF_DPI,
-        first_page=1,
-        last_page=max_slides,
-    )
-    print(f"✅ Extracted {len(pages)} page(s)")
-    
-    saved_paths = []
-    print(f"💾 Saving images as WebP...")
-
-    for i, pil_img in enumerate(pages, start=1):
-        original_size = (pil_img.width, pil_img.height)
-        if pil_img.width > max_width:
-            ratio = max_width / pil_img.width
-            new_height = int(pil_img.height * ratio)
-            pil_img = pil_img.resize((max_width, new_height), Image.LANCZOS)
-            print(f"   📐 Page {i}: Resized {original_size[0]}x{original_size[1]} → {max_width}x{new_height}")
-
-        webp_path = os.path.join(output_folder, f"slide_{i}.webp")
-        img_quality = quality if i == 1 else 5
-        pil_img.convert("RGB").save(webp_path, "webp", quality=img_quality, method=6)
-        webp_size = os.path.getsize(webp_path) / 1024
-        saved_paths.append(webp_path)
-        print(f"   ✅ Saved: slide_{i}.webp ({webp_size:.1f}KB, quality={img_quality})")
-
-    print(f"\n🧹 Cleaning up temporary files and processes...")
-    # Ensure all LibreOffice processes are killed even after successful completion
-    if process_pid:
-        try:
-            kill_all_libreoffice_processes(profile_dir, process_pid)
-        except:
-            pass
-    if os.path.exists(abs_output):
-        shutil.rmtree(abs_output, ignore_errors=True)
-        print(f"🗑️  Deleted temporary output directory: {abs_output}")
-    if os.path.exists(profile_dir):
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        print(f"🗑️  Deleted LibreOffice profile: {profile_dir}")
+            print(f"🗑️  Deleted LibreOffice profile: {profile_dir}")
     
     print(f"\n{'='*80}")
     print(f"✅ Conversion completed: {file_name}")
@@ -837,8 +839,8 @@ def generate_docs_for_soff(doc_id):
                 image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
                     temp_path,
                     output_folder,
-                    quality=60,
-                    max_width=800,
+                    quality=85,
+                    max_width=1600,
                 )
 
             except Exception as e:
@@ -852,8 +854,8 @@ def generate_docs_for_soff(doc_id):
                         image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
                             repaired,
                             output_folder,
-                            quality=60,
-                            max_width=800,
+                            quality=85,
+                            max_width=1600,
                         )
                         print(f"✅ Successfully processed repaired file: {len(image_paths)} image(s)")
                     except Exception as e2:
@@ -892,7 +894,7 @@ def generate_docs_for_soff(doc_id):
             image_paths, pages_count = pdf_to_images_webp(
                 temp_path,
                 output_folder,
-                quality=60,
+                quality=85, max_width=1600,
             )
         else:
             return True
@@ -1001,4 +1003,5 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=10000, workers=1)
+    workers_env = int(os.environ.get("WORKER_COUNT", "4"))
+    process_doc_poster_generate_queue(limit=10000, workers=workers_env)
