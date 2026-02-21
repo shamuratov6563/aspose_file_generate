@@ -34,7 +34,7 @@ PDF_DPI = 200
 
 # LibreOffice conversion limits (configurable via environment variables)
 LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "180"))  # 3 minutes default
-LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "1024"))  # 1GB default
+LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "3072"))  # Increased to 3GB default for Ubuntu reliability
 
 session = requests.Session()
 session.headers.update(headers)
@@ -327,13 +327,17 @@ def not_pdf_to_images_webp_libreoffice(
         if use_xvfb:
             # Wrap command with xvfb-run for virtual display and ulimit for memory
             # -a: auto-display number, -s: server args, screen 0: virtual screen
-            memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+            # Relaxing ulimit -v (virtual memory) as LibreOffice maps many libraries and 
+            # can fail if the limit is too tight. We increase it significantly 
+            # while keeping LIBREOFFICE_MEMORY_LIMIT_MB for display purposes.
+            # Using 3x the nominal limit for virtual memory address space.
+            vmemory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 3
             soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
             soffice_cmd = [
                 "bash", "-c",
-                f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+                f"ulimit -v {vmemory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
             ]
-            print(f"ℹ️ Using xvfb-run for virtual display with memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
+            print(f"ℹ️ Using xvfb-run for virtual display with memory limit (ulimit -v): {vmemory_limit_kb // 1024}MB")
     # On macOS, LibreOffice works in headless mode without needing xvfb
 
     # Monitor running LibreOffice processes before starting
@@ -700,11 +704,12 @@ def try_repair_office_file(path: str) -> str | None:
                 use_xvfb = check_xvfb_available()
                 if use_xvfb:
                     # Apply memory limit with xvfb via ulimit
-                    memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+                    # Using 3x the nominal limit for virtual memory address space.
+                    vmemory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 3
                     soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
                     soffice_cmd = [
                         "bash", "-c",
-                        f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+                        f"ulimit -v {vmemory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
                     ]
 
             process = None
