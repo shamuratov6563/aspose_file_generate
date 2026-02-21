@@ -262,14 +262,23 @@ def not_pdf_to_images_webp_libreoffice(
 ):
     file_name = os.path.basename(ppt_path)
     file_size_mb = os.path.getsize(ppt_path) / (1024 * 1024)
-
-    # Dynamic timeout based on file size
+    
+    # Calculate dynamic timeout based on file size (minimum 120s, add 15s per MB)
+    # Large files need more time to convert
     dynamic_timeout = max(120, LIBREOFFICE_TIMEOUT + int(file_size_mb * 15))
-    print(f"\n{'='*80}")
-    print(f"🔄 Starting conversion: {file_name}")
-    print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB | Timeout: {dynamic_timeout}s")
-    print(f"{'='*80}")
-
+    if dynamic_timeout > LIBREOFFICE_TIMEOUT:
+        print(f"\n{'='*80}")
+        print(f"🔄 Starting conversion: {file_name}")
+        print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
+        print(f"⏱️  Timeout adjusted: {LIBREOFFICE_TIMEOUT}s → {dynamic_timeout}s (based on file size)")
+        print(f"{'='*80}")
+    else:
+        print(f"\n{'='*80}")
+        print(f"🔄 Starting conversion: {file_name}")
+        print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB | Timeout: {LIBREOFFICE_TIMEOUT}s")
+        print(f"{'='*80}")
+        dynamic_timeout = LIBREOFFICE_TIMEOUT
+    
     abs_ppt = os.path.abspath(ppt_path)
     abs_output = tempfile.mkdtemp(prefix="libreoffice_out_")
     os.makedirs(output_folder, exist_ok=True)
@@ -280,13 +289,17 @@ def not_pdf_to_images_webp_libreoffice(
     print(f"📁 Created LibreOffice profile: {profile_dir}")
 
     # Configure LibreOffice profile to disable Java
+    print(f"⚙️  Configuring LibreOffice profile...")
     configure_libreoffice_profile(profile_dir)
 
-    # Environment variables
+    # Create environment for headless LibreOffice operation
     env = os.environ.copy()
+    # Disable X11/display requirements - unset DISPLAY to prevent X11 errors
     env.pop('DISPLAY', None)
+    # Use generic VCL plugin that doesn't require X11
     env['SAL_USE_VCLPLUGIN'] = 'gen'
     env['SAL_DISABLE_OPENCL'] = '1'
+    # Disable Java to avoid Java dependency errors
     env.pop('JAVA_HOME', None)
     env.pop('JRE_HOME', None)
     env.pop('JDK_HOME', None)
@@ -305,100 +318,261 @@ def not_pdf_to_images_webp_libreoffice(
         abs_ppt
     ]
 
-    # Determine if we should use xvfb
+    # Check if xvfb is needed (only for Linux systems without display)
+    # On macOS, LibreOffice works in headless mode without xvfb
     use_xvfb = False
     if platform.system() == 'Linux':
+        # On Linux, xvfb may be needed if no display is available
         use_xvfb = check_xvfb_available()
         if use_xvfb:
-            soffice_cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + soffice_cmd
+            # Wrap command with xvfb-run for virtual display and ulimit for memory
+            # -a: auto-display number, -s: server args, screen 0: virtual screen
+            memory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024
+            soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
+            soffice_cmd = [
+                "bash", "-c",
+                f"ulimit -v {memory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
+            ]
             print(f"ℹ️ Using xvfb-run for virtual display with memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
+    # On macOS, LibreOffice works in headless mode without needing xvfb
 
-    # Determine preexec function
-    preexec = None if use_xvfb else set_process_limits
-
-    # Start LibreOffice process
+    # Monitor running LibreOffice processes before starting
+    running_count = count_running_libreoffice_processes()
+    if running_count > 0:
+        print(f"📊 Currently running LibreOffice processes: {running_count}")
+    
+    print(f"📊 LibreOffice memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB, timeout: {dynamic_timeout}s")
+    print(f"🚀 Launching LibreOffice process...")
+    
     process_start_time = time.time()
     process = None
     process_pid = None
-
+    
     try:
+        # Use Popen to monitor process in real-time
         process = subprocess.Popen(
             soffice_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=preexec,
+            preexec_fn=set_process_limits if not use_xvfb else None,
             env=env
         )
         process_pid = process.pid
         print(f"✅ LibreOffice process started | PID: {process_pid}")
-
-        # Monitor process with timeout
-        while True:
-            if process.poll() is not None:
-                break
+        
+        # Monitor process with periodic updates
+        check_interval = 5  # Check every 5 seconds
+        last_check = 0
+        
+        while process.poll() is None:
             elapsed = time.time() - process_start_time
+            
+            # Print progress every check_interval seconds
+            if int(elapsed) >= last_check + check_interval:
+                print(f"⏳ Processing... ({int(elapsed)}s elapsed)")
+                last_check = int(elapsed)
+            
+            # Check for timeout
             if elapsed > dynamic_timeout:
-                print(f"\n⏱️ TIMEOUT reached ({dynamic_timeout}s), killing LibreOffice...")
+                print(f"\n⏱️  TIMEOUT REACHED ({dynamic_timeout}s)")
+                print(f"🔪 Killing ALL LibreOffice processes for profile...")
+                
+                # Use the robust cleanup function to kill all related processes
                 kill_all_libreoffice_processes(profile_dir, process_pid)
+                
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    print(f"⚠️  Process did not terminate within wait timeout")
+                
+                # Clean up temp directories
+                print(f"🧹 Cleaning up temporary directories...")
+                if os.path.exists(abs_output):
+                    shutil.rmtree(abs_output, ignore_errors=True)
+                    print(f"🗑️  Deleted: {abs_output}")
+                if os.path.exists(profile_dir):
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    print(f"🗑️  Deleted: {profile_dir}")
+                
                 raise subprocess.TimeoutExpired("soffice", dynamic_timeout)
+            
             time.sleep(1)
-
+        
+        # Process completed
+        elapsed_total = time.time() - process_start_time
+        print(f"✅ Process completed in {elapsed_total:.1f}s | Exit code: {process.returncode}")
+        
+        # Get stdout and stderr
         stdout, stderr = process.communicate()
-        print(f"✅ Process completed | Exit code: {process.returncode}")
+        
         if stdout:
             print(f"📤 STDOUT: {stdout[:500]}{'...' if len(stdout) > 500 else ''}")
         if stderr:
             print(f"📤 STDERR: {stderr[:500]}{'...' if len(stderr) > 500 else ''}")
-
-        # Check PDF output
-        pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
-        if not pdf_candidates:
-            error_msg = stderr or stdout or "Unknown error"
-            # Handle X11/display errors
-            if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
-                raise RuntimeError(
-                    f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb'\n"
-                    f"Original error: {error_msg}"
-                )
-            raise RuntimeError(f"LibreOffice failed: {error_msg}")
-
-        pdf_path = pdf_candidates[0]
-        print(f"📄 Generated PDF: {pdf_path}")
-
-    finally:
-        # Cleanup LibreOffice processes and temp profile
+        
+        # Check for memory limit violations (signal 9 = SIGKILL, signal 11 = SIGSEGV)
+        if process.returncode == -9 or (stderr and ('Killed' in stderr or 'SIGKILL' in stderr)):
+            print(f"\n⚠️  MEMORY LIMIT VIOLATION DETECTED!")
+            print(f"💀 Process was killed due to exceeding {LIBREOFFICE_MEMORY_LIMIT_MB}MB memory limit")
+            print(f"🧹 Cleaning up temporary files...")
+            if os.path.exists(abs_output):
+                shutil.rmtree(abs_output, ignore_errors=True)
+                print(f"🗑️  Deleted: {abs_output}")
+            if os.path.exists(profile_dir):
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                print(f"🗑️  Deleted: {profile_dir}")
+            raise RuntimeError(f"LibreOffice exceeded memory limit ({LIBREOFFICE_MEMORY_LIMIT_MB}MB) and was killed")
+        
+        result = type('Result', (), {
+            'returncode': process.returncode,
+            'stdout': stdout,
+            'stderr': stderr
+        })()
+        
+    except subprocess.TimeoutExpired as e:
+        print(f"\n❌ Conversion failed: Timeout after {dynamic_timeout}s")
+        # Ensure cleanup happens
         if process_pid:
             kill_all_libreoffice_processes(profile_dir, process_pid)
-        if os.path.exists(profile_dir):
-            shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        if process and process.poll() is None:
+            print(f"\n⚠️  Exception occurred, cleaning up process (PID: {process_pid})...")
+            kill_all_libreoffice_processes(profile_dir, process_pid)
+        raise
+    finally:
+        # Always ensure cleanup of any remaining processes
+        if process_pid and process and process.poll() is None:
+            try:
+                kill_all_libreoffice_processes(profile_dir, process_pid)
+            except:
+                pass
+
+    # Find any PDF in the output folder
+    print(f"\n📋 Searching for generated PDF in: {abs_output}")
+    pdf_candidates = glob.glob(os.path.join(abs_output, "*.pdf"))
+    
+    if pdf_candidates:
+        print(f"✅ Found {len(pdf_candidates)} PDF file(s)")
+        for pdf in pdf_candidates:
+            pdf_size = os.path.getsize(pdf) / (1024 * 1024)
+            print(f"   📄 {os.path.basename(pdf)} ({pdf_size:.2f}MB)")
+
+    # Check if PDF was actually created, even if returncode is non-zero
+    # (Java warnings can cause non-zero exit codes even when conversion succeeds)
+    if not pdf_candidates:
+        error_msg = result.stderr or result.stdout or "Unknown error"
+        print(f"\n❌ No PDF file generated!")
+        print(f"🧹 Cleaning up temporary directories...")
+        
+        # Check for X11/display errors
+        if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
+            xvfb_available = check_xvfb_available()
+            if not xvfb_available:
+                if os.path.exists(abs_output):
+                    shutil.rmtree(abs_output, ignore_errors=True)
+                    print(f"🗑️  Deleted: {abs_output}")
+                if os.path.exists(profile_dir):
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    print(f"🗑️  Deleted: {profile_dir}")
+                raise RuntimeError(
+                    f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb' or 'yum install xorg-x11-server-Xvfb'\n"
+                    f"Original error: {error_msg}"
+                )
+            else:
+                if os.path.exists(abs_output):
+                    shutil.rmtree(abs_output, ignore_errors=True)
+                    print(f"🗑️  Deleted: {abs_output}")
+                if os.path.exists(profile_dir):
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    print(f"🗑️  Deleted: {profile_dir}")
+                raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
+        if result.returncode != 0:
+            if os.path.exists(abs_output):
+                shutil.rmtree(abs_output, ignore_errors=True)
+                print(f"🗑️  Deleted: {abs_output}")
+            if os.path.exists(profile_dir):
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                print(f"🗑️  Deleted: {profile_dir}")
+            raise RuntimeError(f"LibreOffice failed: {error_msg}")
+        
         if os.path.exists(abs_output):
             shutil.rmtree(abs_output, ignore_errors=True)
+            print(f"🗑️  Deleted: {abs_output}")
+        if os.path.exists(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            print(f"🗑️  Deleted: {profile_dir}")
+        raise RuntimeError(
+            f"No PDF generated in {abs_output}. LibreOffice stdout: {result.stdout} stderr: {result.stderr}")
 
-    # Convert PDF to images
+    # If PDF was created but returncode is non-zero, log warning but continue
+    if result.returncode != 0:
+        # Check if stderr only contains Java-related warnings
+        stderr_lower = result.stderr.lower()
+        java_warnings = ['java', 'javaldx', 'jvm', 'java runtime environment']
+        if any(warning in stderr_lower for warning in java_warnings):
+            print(f"⚠️  LibreOffice completed conversion but reported Java warnings (PDF was created)")
+        else:
+            # Non-Java error, but PDF exists - log warning but proceed
+            print(f"⚠️  LibreOffice returned non-zero exit code ({result.returncode}) but PDF was created")
+
+    pdf_path = pdf_candidates[0]  # pick first PDF
+    pdf_size = os.path.getsize(pdf_path) / (1024 * 1024)
+    print(f"\n📄 Using generated PDF: {os.path.basename(pdf_path)} ({pdf_size:.2f}MB)")
+
+    print(f"📊 Extracting page information...")
     total_pages = get_pdf_page_count(pdf_path)
+    if total_pages:
+        print(f"✅ PDF has {total_pages} pages")
+    else:
+        print(f"⚠️  Could not determine page count, will extract first {max_slides} pages")
+    
+    print(f"🖼️  Converting PDF pages to images (max {max_slides} pages)...")
     pages = convert_from_path(
         pdf_path,
         dpi=PDF_DPI,
         first_page=1,
         last_page=max_slides,
     )
-    print(f"🖼️ Extracted {len(pages)} page(s)")
-
+    print(f"✅ Extracted {len(pages)} page(s)")
+    
     saved_paths = []
+    print(f"💾 Saving images as WebP...")
+
     for i, pil_img in enumerate(pages, start=1):
         original_size = (pil_img.width, pil_img.height)
         if pil_img.width > max_width:
             ratio = max_width / pil_img.width
             new_height = int(pil_img.height * ratio)
             pil_img = pil_img.resize((max_width, new_height), Image.LANCZOS)
-            print(f"   📐 Page {i}: Resized {original_size} → {pil_img.size}")
+            print(f"   📐 Page {i}: Resized {original_size[0]}x{original_size[1]} → {max_width}x{new_height}")
 
         webp_path = os.path.join(output_folder, f"slide_{i}.webp")
         img_quality = quality if i == 1 else 5
         pil_img.convert("RGB").save(webp_path, "webp", quality=img_quality, method=6)
+        webp_size = os.path.getsize(webp_path) / 1024
         saved_paths.append(webp_path)
-        print(f"   ✅ Saved: {os.path.basename(webp_path)} (quality={img_quality})")
+        print(f"   ✅ Saved: slide_{i}.webp ({webp_size:.1f}KB, quality={img_quality})")
+
+    print(f"\n🧹 Cleaning up temporary files and processes...")
+    # Ensure all LibreOffice processes are killed even after successful completion
+    if process_pid:
+        try:
+            kill_all_libreoffice_processes(profile_dir, process_pid)
+        except:
+            pass
+    if os.path.exists(abs_output):
+        shutil.rmtree(abs_output, ignore_errors=True)
+        print(f"🗑️  Deleted temporary output directory: {abs_output}")
+    if os.path.exists(profile_dir):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        print(f"🗑️  Deleted LibreOffice profile: {profile_dir}")
+    
+    print(f"\n{'='*80}")
+    print(f"✅ Conversion completed: {file_name}")
+    print(f"📊 Result: {len(saved_paths)} images generated | Total pages: {total_pages or len(pages)}")
+    print(f"{'='*80}\n")
 
     return saved_paths, total_pages or len(pages)
 
@@ -790,7 +964,7 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
     for p in processes:
         p.start()
 
-    start = 893976
+    start = 1195807
 
     for _ in range(limit):
         endpoint = f"{BASE_URL}/api/v1/seller/moderation-change/?type=true"
@@ -818,4 +992,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 
 if __name__ == "__main__":
-    process_doc_poster_generate_queue(limit=10000, workers=4)
+    process_doc_poster_generate_queue(limit=10000, workers=1)
