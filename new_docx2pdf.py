@@ -917,7 +917,7 @@ def generate_docs_for_soff(doc_id):
             print(f"   📊 Page count: {pages_count}")
 
             session.patch(
-                f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
+                f"{BASE_URL}/api/v1/seller/admin/product-next-list/{doc_id}/",
                 files=files,
                 data=data,
                 timeout=REQUEST_TIMEOUT,
@@ -991,7 +991,7 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
             print(f"📥 Queued doc_id={doc_id}")
             queue.put(doc_id)
             print("last...")
-            start = doc_id + 1
+            start = doc_id
 
         time.sleep(0.2)  # avoid hammering API
 
