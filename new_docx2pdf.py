@@ -818,10 +818,20 @@ def generate_docs_for_soff(doc_id):
             timeout=REQUEST_TIMEOUT,
         )
         data = response.json()
-        file_type = data['document']['file_type'].lower()
-        file_url = data['document']['file_url']
+        
+        # Check if 'document' exists in response for safer access
+        document_data = data.get('document')
+        if not document_data:
+            print(f"❌ Error: 'document' key missing in API response for doc_id={doc_id}")
+            print(f"🔍 Full Response: {data}")
+            return True
+
+        file_type = document_data.get('file_type', '').lower()
+        file_url = document_data.get('file_url')
+        
         if not file_url:
             print(f"⚠️  No file URL found for doc_id={doc_id}, skipping")
+            print(f"🔍 Document Data: {document_data}")
             return True
         temp_path = f"temp_copy_{doc_id}{file_type}"
         output_folder = f"images_slide_copy_{doc_id}"
