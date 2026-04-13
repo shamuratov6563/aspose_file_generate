@@ -929,7 +929,7 @@ def generate_docs_for_soff(doc_id):
             print(f"   📊 Page count: {pages_count}")
 
             session.patch(
-                f"{BASE_URL}/api/v1/seller/admin/product-next-list/{doc_id}/",
+                f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
                 files=files,
                 data=data,
                 timeout=REQUEST_TIMEOUT,
