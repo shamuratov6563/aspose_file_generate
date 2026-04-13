@@ -23,6 +23,8 @@ load_dotenv()  # This loads variables from a .env file in the current directory
 # Access environment variables
 TOKEN = os.getenv("TOKEN")
 BASE_URL = os.getenv("BASE_URL")
+LIMIT = int(os.getenv("LIMIT", "10000"))
+START_ID = int(os.getenv("START_ID", "1195807"))
 
 # Define a local temporary directory to bypass Snap sandboxing which often prevents access to system /tmp
 LOCAL_TMP_DIR = os.path.join(os.getcwd(), 'tmp_libreoffice')
@@ -976,7 +978,9 @@ def worker(queue: Queue):
         generate_docs_for_soff(doc_id)
 
 
-def process_doc_poster_generate_queue(limit=100, workers=None):
+def process_doc_poster_generate_queue(limit=None, workers=None, start_id=None):
+    limit = limit or LIMIT
+    start_id = start_id or START_ID
     workers = workers or max(2, cpu_count() // 2)
     queue = Queue(maxsize=workers * 2)
 
@@ -985,7 +989,7 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
     for p in processes:
         p.start()
 
-    start = 1195807
+    start = start_id
 
     for _ in range(limit):
         endpoint = f"{BASE_URL}/api/v1/seller/moderation-change/?type=true"
@@ -1014,4 +1018,4 @@ def process_doc_poster_generate_queue(limit=100, workers=None):
 
 if __name__ == "__main__":
     workers_env = int(os.environ.get("WORKER_COUNT", "4"))
-    process_doc_poster_generate_queue(limit=10000, workers=workers_env)
+    process_doc_poster_generate_queue(workers=workers_env)
