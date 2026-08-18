@@ -1,8 +1,6 @@
 import glob
 import os
-import platform
 import resource
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +27,10 @@ START_ID = int(os.getenv("START_ID", "1195807"))
 # Define a local temporary directory to bypass Snap sandboxing which often prevents access to system /tmp
 LOCAL_TMP_DIR = os.path.join(os.getcwd(), 'tmp_libreoffice')
 os.makedirs(LOCAL_TMP_DIR, exist_ok=True)
+
+# Documents that failed conversion are appended here so they can be re-run.
+# Without this a failed doc is silently skipped and stays stuck in moderation forever.
+FAILED_LOG = os.getenv("FAILED_LOG", os.path.join(os.getcwd(), "failed_doc_ids.log"))
 
 headers = {'Authorization': f"Bearer {TOKEN}"}
 
@@ -65,42 +67,29 @@ def get_pdf_page_count(pdf_path: str) -> int | None:
         return None
 
 
-def set_process_limits():
+def make_process_limiter(cpu_seconds: int):
     """
-    Set resource limits for the current process (used as preexec_fn for subprocess).
-    Limits memory usage and CPU time for LibreOffice conversion.
-    Only works on Unix-like systems (Linux, macOS).
+    Build a preexec_fn that limits the LibreOffice child process.
+
+    RLIMIT_AS caps *virtual* address space, not resident memory, and LibreOffice
+    maps far more address space than it actually uses. Capping it at the nominal
+    limit kills healthy conversions, so use 3x -- the same headroom the old
+    xvfb `ulimit -v` path used.
+
+    RLIMIT_CPU must track the caller's size-scaled timeout. Previously it was
+    pinned to the static LIBREOFFICE_TIMEOUT, so the kernel SIGKILLed large
+    files at 180 CPU-seconds no matter what the dynamic timeout said.
     """
-    try:
-        # Set memory limit in bytes
-        memory_limit_bytes = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 1024
-        # RLIMIT_AS limits the virtual memory address space
-        resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-
-        # Set CPU time limit in seconds (soft and hard limit)
-        cpu_time_limit = LIBREOFFICE_TIMEOUT
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_time_limit, cpu_time_limit))
-
-        # Set data segment size limit (heap memory)
-        resource.setrlimit(resource.RLIMIT_DATA, (memory_limit_bytes, memory_limit_bytes))
-    except (ValueError, OSError, AttributeError) as e:
-        # On some systems, setting limits might fail - log but don't fail
-        # AttributeError can occur if resource module doesn't have the constant
-        print(f"⚠️ Could not set all resource limits: {e}")
-
-
-def check_xvfb_available():
-    """Check if xvfb-run is available for virtual display."""
-    try:
-        result = subprocess.run(
-            ["which", "xvfb-run"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    def set_process_limits():
+        try:
+            # 3x nominal: virtual address space, not resident memory
+            vmem_bytes = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 1024 * 3
+            resource.setrlimit(resource.RLIMIT_AS, (vmem_bytes, vmem_bytes))
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+        except (ValueError, OSError, AttributeError) as e:
+            # On some systems setting limits fails - log but don't fail the conversion
+            print(f"⚠️ Could not set all resource limits: {e}")
+    return set_process_limits
 
 
 def count_running_libreoffice_processes():
@@ -300,10 +289,11 @@ def not_pdf_to_images_webp_libreoffice(
 
     # Create environment for headless LibreOffice operation
     env = os.environ.copy()
-    # Disable X11/display requirements - unset DISPLAY to prevent X11 errors
+    # Do NOT set SAL_USE_VCLPLUGIN: 'gen' is the *X11* plugin and forces a display
+    # dependency. With it unset, --headless selects the headless 'svp' backend and
+    # needs no display server at all (verified on LibreOffice 25.8).
     env.pop('DISPLAY', None)
-    # Use generic VCL plugin that doesn't require X11
-    env['SAL_USE_VCLPLUGIN'] = 'gen'
+    env.pop('SAL_USE_VCLPLUGIN', None)
     env['SAL_DISABLE_OPENCL'] = '1'
     # Disable Java to avoid Java dependency errors
     env.pop('JAVA_HOME', None)
@@ -324,27 +314,9 @@ def not_pdf_to_images_webp_libreoffice(
         abs_ppt
     ]
 
-    # Check if xvfb is needed (only for Linux systems without display)
-    # On macOS, LibreOffice works in headless mode without xvfb
-    use_xvfb = False
-    if platform.system() == 'Linux':
-        # On Linux, xvfb may be needed if no display is available
-        use_xvfb = check_xvfb_available()
-        if use_xvfb:
-            # Wrap command with xvfb-run for virtual display and ulimit for memory
-            # -a: auto-display number, -s: server args, screen 0: virtual screen
-            # Relaxing ulimit -v (virtual memory) as LibreOffice maps many libraries and 
-            # can fail if the limit is too tight. We increase it significantly 
-            # while keeping LIBREOFFICE_MEMORY_LIMIT_MB for display purposes.
-            # Using 3x the nominal limit for virtual memory address space.
-            vmemory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 3
-            soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
-            soffice_cmd = [
-                "bash", "-c",
-                f"ulimit -v {vmemory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
-            ]
-            print(f"ℹ️ Using xvfb-run for virtual display with memory limit (ulimit -v): {vmemory_limit_kb // 1024}MB")
-    # On macOS, LibreOffice works in headless mode without needing xvfb
+    # No xvfb wrapper: headless LibreOffice needs no display server, and wrapping
+    # in `bash -c ... xvfb-run` meant a SIGKILL on timeout orphaned the Xvfb process
+    # and its /tmp lock every single time a conversion timed out.
 
     # Monitor running LibreOffice processes before starting
     running_count = count_running_libreoffice_processes()
@@ -365,7 +337,7 @@ def not_pdf_to_images_webp_libreoffice(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=set_process_limits if not use_xvfb else None,
+            preexec_fn=make_process_limiter(dynamic_timeout),
             env=env
         )
         process_pid = process.pid
@@ -477,28 +449,6 @@ def not_pdf_to_images_webp_libreoffice(
             print(f"\n❌ No PDF file generated!")
             print(f"🧹 Cleaning up temporary directories...")
             
-            # Check for X11/display errors
-            if "X11 error" in error_msg or "Can't open display" in error_msg or "DISPLAY" in error_msg:
-                xvfb_available = check_xvfb_available()
-                if not xvfb_available:
-                    if os.path.exists(abs_output):
-                        shutil.rmtree(abs_output, ignore_errors=True)
-                        print(f"🗑️  Deleted: {abs_output}")
-                    if os.path.exists(profile_dir):
-                        shutil.rmtree(profile_dir, ignore_errors=True)
-                        print(f"🗑️  Deleted: {profile_dir}")
-                    raise RuntimeError(
-                        f"LibreOffice requires a display server. Install xvfb: 'apt-get install xvfb' or 'yum install xorg-x11-server-Xvfb'\n"
-                        f"Original error: {error_msg}"
-                    )
-                else:
-                    if os.path.exists(abs_output):
-                        shutil.rmtree(abs_output, ignore_errors=True)
-                        print(f"🗑️  Deleted: {abs_output}")
-                    if os.path.exists(profile_dir):
-                        shutil.rmtree(profile_dir, ignore_errors=True)
-                        print(f"🗑️  Deleted: {profile_dir}")
-                    raise RuntimeError(f"LibreOffice X11 error despite xvfb: {error_msg}")
             if result.returncode != 0:
                 if os.path.exists(abs_output):
                     shutil.rmtree(abs_output, ignore_errors=True)
@@ -690,7 +640,7 @@ def try_repair_office_file(path: str) -> str | None:
             # Create environment for headless LibreOffice operation
             env = os.environ.copy()
             env.pop('DISPLAY', None)
-            env['SAL_USE_VCLPLUGIN'] = 'gen'
+            env.pop('SAL_USE_VCLPLUGIN', None)
             env['SAL_DISABLE_OPENCL'] = '1'
             env.pop('JAVA_HOME', None)
             env.pop('JRE_HOME', None)
@@ -706,20 +656,6 @@ def try_repair_office_file(path: str) -> str | None:
                 path
             ]
 
-            # Use xvfb-run only on Linux if available (not needed on macOS)
-            use_xvfb = False
-            if platform.system() == 'Linux':
-                use_xvfb = check_xvfb_available()
-                if use_xvfb:
-                    # Apply memory limit with xvfb via ulimit
-                    # Using 3x the nominal limit for virtual memory address space.
-                    vmemory_limit_kb = LIBREOFFICE_MEMORY_LIMIT_MB * 1024 * 3
-                    soffice_cmd_escaped = ' '.join(shlex.quote(arg) for arg in soffice_cmd)
-                    soffice_cmd = [
-                        "bash", "-c",
-                        f"ulimit -v {vmemory_limit_kb} && xvfb-run -a -s '-screen 0 1024x768x24' {soffice_cmd_escaped}"
-                    ]
-
             process = None
             try:
                 process = subprocess.run(
@@ -728,7 +664,7 @@ def try_repair_office_file(path: str) -> str | None:
                     stderr=subprocess.PIPE,
                     text=True,
                     timeout=LIBREOFFICE_TIMEOUT,
-                    preexec_fn=set_process_limits if not use_xvfb else None,
+                    preexec_fn=make_process_limiter(LIBREOFFICE_TIMEOUT),
                     env=env
                 )
                 if process.returncode != 0:
@@ -806,9 +742,19 @@ def try_repair_office_file(path: str) -> str | None:
         return None
     
 
+def record_failure(doc_id, reason):
+    """Append a failed doc_id so it can be retried instead of being lost."""
+    try:
+        with open(FAILED_LOG, "a") as fh:
+            fh.write(f"{doc_id}\t{reason}\n")
+    except Exception as exc:
+        print(f"⚠️ Could not write to {FAILED_LOG}: {exc}")
+
+
 def generate_docs_for_soff(doc_id):
     temp_path = None
     output_folder = None
+    success = False
     try:
         print(f"\n{'#'*80}")
         print(f"🆔 Processing document ID: {doc_id}")
@@ -819,6 +765,7 @@ def generate_docs_for_soff(doc_id):
             stream=True,
             timeout=REQUEST_TIMEOUT,
         )
+        response.raise_for_status()
         data = response.json()
         
         # Check if 'document' exists in response for safer access
@@ -882,7 +829,8 @@ def generate_docs_for_soff(doc_id):
                         if os.path.exists(output_folder):
                             shutil.rmtree(output_folder, ignore_errors=True)
                             print(f"   🗑️  Deleted: {output_folder}")
-                            return False
+                        record_failure(doc_id, f"repair+convert failed: {e2!r}")
+                        return False
                 else:
                     print(f"❌ Could not repair file, skipping doc_id={doc_id}")
                     print(f"🗑️  Cleaning up files...")
@@ -892,7 +840,8 @@ def generate_docs_for_soff(doc_id):
                     if os.path.exists(output_folder):
                         shutil.rmtree(output_folder, ignore_errors=True)
                         print(f"   🗑️  Deleted: {output_folder}")
-                        return False
+                    record_failure(doc_id, f"unrepairable: {e!r}")
+                    return False
             finally:
                 print(f"\n🧹 Final cleanup of temporary files...")
                 if repaired and os.path.exists(repaired):
@@ -928,12 +877,14 @@ def generate_docs_for_soff(doc_id):
             data = {'page_count': pages_count}
             print(f"   📊 Page count: {pages_count}")
 
-            session.patch(
+            patch_response = session.patch(
                 f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
                 files=files,
                 data=data,
                 timeout=REQUEST_TIMEOUT,
             )
+            # Without this an upload that 500s still printed "COMPLETED"
+            patch_response.raise_for_status()
         upload_time = time.time() - upload_start
         print(f"✅ Upload completed in {upload_time:.1f}s")
         
@@ -943,6 +894,7 @@ def generate_docs_for_soff(doc_id):
             shutil.rmtree(output_folder, ignore_errors=True)
             print(f"🗑️  Deleted: {output_folder}")
         
+        success = True
         print(f"\n{'='*80}")
         print(f"✅ COMPLETED doc_id={doc_id}")
         print(f"{'='*80}\n")
@@ -953,6 +905,7 @@ def generate_docs_for_soff(doc_id):
         print(f"{'='*80}")
         import traceback
         print(f"Traceback:\n{traceback.format_exc()}")
+        record_failure(doc_id, repr(e))
 
     finally:
         # Cleanup temp files
@@ -964,7 +917,7 @@ def generate_docs_for_soff(doc_id):
             shutil.rmtree(output_folder, ignore_errors=True)
             print(f"🗑️  Deleted output folder: {output_folder}")
 
-    return True
+    return success
 
 
 # ========= Worker & Queue System =========
@@ -975,7 +928,8 @@ def worker(queue: Queue):
         doc_id = queue.get()
         if doc_id is None:  # Poison pill -> stop worker
             break
-        generate_docs_for_soff(doc_id)
+        if not generate_docs_for_soff(doc_id):
+            print(f"⚠️  doc_id={doc_id} FAILED -- recorded in {FAILED_LOG}")
 
 
 def process_doc_poster_generate_queue(limit=None, workers=None, start_id=None):
