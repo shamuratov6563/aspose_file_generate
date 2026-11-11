@@ -12,17 +12,62 @@ from multiprocessing import Process, Queue, cpu_count
 import requests
 from PIL import Image
 from pdf2image import convert_from_path, pdfinfo_from_path
+import inspect
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 load_dotenv()  # This loads variables from a .env file in the current directory
 
+
+def env_int(name: str, default: int) -> int:
+    """
+    Read an integer setting from the environment.
+
+    A blank or malformed value falls back to the default instead of killing the
+    whole run at import time (a stray `LIBREOFFICE_TIMEOUT_SECONDS=` in .env
+    used to crash the process before a single document was touched).
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not an integer, using default {default}")
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    """Same as env_int, for fractional settings like a retry backoff factor."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not a number, using default {default}")
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """Accepts 1/0, true/false, yes/no, on/off (case-insensitive)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    print(f"WARNING: {name}={raw!r} is not a boolean, using default {default}")
+    return default
+
 # Access environment variables
 TOKEN = os.getenv("TOKEN")
 BASE_URL = os.getenv("BASE_URL")
-LIMIT = int(os.getenv("LIMIT", "10000"))
-START_ID = int(os.getenv("START_ID", "1195807"))
+LIMIT = env_int("LIMIT", 10000)
+START_ID = env_int("START_ID", 1195807)
 
 # Define a local temporary directory to bypass Snap sandboxing which often prevents access to system /tmp
 LOCAL_TMP_DIR = os.path.join(os.getcwd(), 'tmp_libreoffice')
@@ -34,24 +79,202 @@ FAILED_LOG = os.getenv("FAILED_LOG", os.path.join(os.getcwd(), "failed_doc_ids.l
 
 headers = {'Authorization': f"Bearer {TOKEN}"}
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT_SECONDS", 120)
 DOWNLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB chunks for large files
 DEFAULT_MAX_SLIDES = 4
 DEFAULT_MAX_PDF_PAGES = 3
 PDF_DPI = 300
 
-# LibreOffice conversion limits (configurable via environment variables)
-LIBREOFFICE_TIMEOUT = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "180"))  # 3 minutes default
-LIBREOFFICE_MEMORY_LIMIT_MB = int(os.getenv("LIBREOFFICE_MEMORY_LIMIT_MB", "3072"))  # Increased to 3GB default for Ubuntu reliability
+# pdf2image only grew a `timeout` kwarg in later versions; pass it when the
+# installed version accepts it so poppler cannot outlive the document budget.
+_CONVERT_TIMEOUT_SUPPORTED = "timeout" in inspect.signature(convert_from_path).parameters
 
+
+def raster_kwargs(deadline, stage):
+    """convert_from_path kwargs carrying whatever is left of the budget."""
+    left = budget_left(deadline, stage)
+    if left is None or not _CONVERT_TIMEOUT_SUPPORTED:
+        return {}
+    return {"timeout": max(1, int(left))}
+
+# ---------------------------------------------------------------------------
+# LibreOffice conversion limits -- every knob below is read from .env
+# ---------------------------------------------------------------------------
+# How long one document may take to generate before we give up on it. The
+# effective budget is size-scaled:
+#
+#   timeout = clamp(LIBREOFFICE_TIMEOUT_SECONDS + size_mb * PER_MB,
+#                   MIN_SECONDS, MAX_SECONDS)
+#
+# Raise LIBREOFFICE_TIMEOUT_MAX_SECONDS on a fast dedicated box; lower it when
+# a stuck document must not hold a worker for long.
+LIBREOFFICE_TIMEOUT = env_int("LIBREOFFICE_TIMEOUT_SECONDS", 180)               # base budget, 3 min
+LIBREOFFICE_TIMEOUT_PER_MB = env_int("LIBREOFFICE_TIMEOUT_PER_MB_SECONDS", 15)  # extra seconds per MB
+LIBREOFFICE_TIMEOUT_MIN = env_int("LIBREOFFICE_TIMEOUT_MIN_SECONDS", 120)       # never below this
+LIBREOFFICE_TIMEOUT_MAX = env_int("LIBREOFFICE_TIMEOUT_MAX_SECONDS", 1800)      # hard cap, 0 = no cap
+# How often the monitor loop prints progress, and how long we wait for a killed
+# process to actually die.
+LIBREOFFICE_PROGRESS_INTERVAL = max(1, env_int("LIBREOFFICE_PROGRESS_INTERVAL_SECONDS", 5))
+LIBREOFFICE_KILL_WAIT = max(1, env_int("LIBREOFFICE_KILL_WAIT_SECONDS", 5))
+LIBREOFFICE_MEMORY_LIMIT_MB = env_int("LIBREOFFICE_MEMORY_LIMIT_MB", 3072)      # 3GB default for Ubuntu reliability
+
+
+def compute_conversion_timeout(file_size_mb: float) -> int:
+    """
+    Seconds a single LibreOffice conversion is allowed to run.
+
+    Bigger files legitimately need longer, so the base budget grows with size
+    and is then clamped into [MIN, MAX]. The cap matters: without it a 200MB
+    upload asked for ~3200s and pinned a worker for nearly an hour.
+    """
+    timeout = LIBREOFFICE_TIMEOUT + int(file_size_mb * LIBREOFFICE_TIMEOUT_PER_MB)
+    timeout = max(timeout, LIBREOFFICE_TIMEOUT_MIN)
+    if LIBREOFFICE_TIMEOUT_MAX > 0:
+        timeout = min(timeout, LIBREOFFICE_TIMEOUT_MAX)
+    return timeout
+
+
+# ---------------------------------------------------------------------------
+# Per-document budget
+# ---------------------------------------------------------------------------
+# A document passes through several stages (metadata, download, convert,
+# optional repair + retry, rasterize, upload) and each has its own limit, so
+# without an overall ceiling one bad document could hold a worker far longer
+# than any single timeout suggests. DOC_TOTAL_TIMEOUT_SECONDS caps the whole
+# pipeline: every stage below is given the smaller of its own limit and what is
+# left of this budget. 0 = no overall ceiling (old behaviour).
+DOC_TOTAL_TIMEOUT = env_int("DOC_TOTAL_TIMEOUT_SECONDS", 2400)  # 40 min
+# A stage is not even started with less than this many seconds left -- better to
+# fail fast and record the doc than to launch LibreOffice with 2 seconds.
+DOC_BUDGET_MIN_STAGE = max(1, env_int("DOC_BUDGET_MIN_STAGE_SECONDS", 10))
+
+
+class DocumentDeadlineExceeded(Exception):
+    """One document used up its whole DOC_TOTAL_TIMEOUT_SECONDS budget."""
+
+
+def make_deadline():
+    """Start the clock for one document. None means no overall ceiling."""
+    if DOC_TOTAL_TIMEOUT <= 0:
+        return None
+    return time.monotonic() + DOC_TOTAL_TIMEOUT
+
+
+def budget_left(deadline, stage: str, minimum: int = None) -> float | None:
+    """
+    Seconds left in this document's total budget, or None when unlimited.
+
+    Raises DocumentDeadlineExceeded when there is not enough left to start
+    `stage`. Uses time.monotonic() so a clock adjustment mid-conversion cannot
+    make the budget jump.
+    """
+    if deadline is None:
+        return None
+    if minimum is None:
+        minimum = DOC_BUDGET_MIN_STAGE
+    left = deadline - time.monotonic()
+    if left < minimum:
+        raise DocumentDeadlineExceeded(
+            f"document budget of {DOC_TOTAL_TIMEOUT}s exhausted before {stage} "
+            f"({max(0.0, left):.0f}s left, need {minimum}s)"
+        )
+    return left
+
+
+def stage_timeout(deadline, stage: str, own_limit: int) -> int:
+    """A stage's effective timeout: its own limit, capped by the budget left."""
+    left = budget_left(deadline, stage)
+    if left is None:
+        return own_limit
+    return max(1, int(min(own_limit, left)))
+
+# ---------------------------------------------------------------------------
+# HTTP retries
+# ---------------------------------------------------------------------------
+# urllib3 retries happen INSIDE a single session.get/patch call, so the
+# per-document budget cannot interrupt them: one unhealthy endpoint can hold a
+# worker for (HTTP_RETRY_TOTAL + 1) * REQUEST_TIMEOUT_SECONDS plus backoff.
+# Keep HTTP_RETRY_TOTAL low when DOC_TOTAL_TIMEOUT_SECONDS is tight --
+# http_worst_case_seconds() below reports the real number and warns on startup.
+HTTP_RETRY_TOTAL = max(0, env_int("HTTP_RETRY_TOTAL", 5))
+HTTP_RETRY_BACKOFF_FACTOR = env_float("HTTP_RETRY_BACKOFF_FACTOR", 0.5)
+HTTP_RETRY_BACKOFF_MAX = env_float("HTTP_RETRY_BACKOFF_MAX_SECONDS", 30.0)
+# A 429 may carry `Retry-After: 600`, which urllib3 honours literally and which
+# no timeout of ours can cut short. Set to 0 to ignore the header and use our
+# own backoff instead.
+HTTP_RESPECT_RETRY_AFTER = env_bool("HTTP_RESPECT_RETRY_AFTER", True)
+
+
+def http_backoff_seconds() -> float:
+    """
+    Total time urllib3 spends sleeping between retries, worst case.
+
+    Mirrors urllib3's get_backoff_time(): no sleep before the first retry, then
+    backoff_factor * 2**(n-1) for the nth, each capped at backoff_max.
+    """
+    total = 0.0
+    for attempt in range(2, HTTP_RETRY_TOTAL + 1):
+        total += min(HTTP_RETRY_BACKOFF_FACTOR * (2 ** (attempt - 1)), HTTP_RETRY_BACKOFF_MAX)
+    return total
+
+
+def http_worst_case_seconds() -> float:
+    """
+    Longest one HTTP call can take: every attempt timing out, plus backoff.
+
+    This is the part of a document's runtime the budget cannot bound, so it is
+    worth knowing before it surprises you in production.
+    """
+    return (HTTP_RETRY_TOTAL + 1) * REQUEST_TIMEOUT + http_backoff_seconds()
+
+
+def log_timeout_config():
+    """Print the effective timeout settings, and warn if they contradict."""
+    print("=" * 80)
+    print("⏱️  Timeout configuration")
+    print(f"   document budget      : {DOC_TOTAL_TIMEOUT or 'unlimited'}s"
+          f" (min per stage {DOC_BUDGET_MIN_STAGE}s)")
+    print(f"   conversion           : base {LIBREOFFICE_TIMEOUT}s"
+          f" + {LIBREOFFICE_TIMEOUT_PER_MB}s/MB,"
+          f" clamped to [{LIBREOFFICE_TIMEOUT_MIN}s,"
+          f" {LIBREOFFICE_TIMEOUT_MAX or 'unlimited'}s]")
+    print(f"   http request         : {REQUEST_TIMEOUT}s,"
+          f" {HTTP_RETRY_TOTAL} retries,"
+          f" backoff x{HTTP_RETRY_BACKOFF_FACTOR} (max {HTTP_RETRY_BACKOFF_MAX}s),"
+          f" respect Retry-After: {HTTP_RESPECT_RETRY_AFTER}")
+    worst_http = http_worst_case_seconds()
+    print(f"   worst case per http call : {worst_http:.0f}s"
+          f" ({HTTP_RETRY_TOTAL + 1} attempts + {http_backoff_seconds():.1f}s backoff)")
+    if DOC_TOTAL_TIMEOUT > 0:
+        # The final upload is exempt from the budget AND is itself retried, so
+        # it contributes its full worst case, not just one REQUEST_TIMEOUT.
+        print(f"   worst case per document  : {DOC_TOTAL_TIMEOUT + worst_http:.0f}s"
+              f" (budget + the exempt final upload, retries included)")
+        if worst_http > DOC_TOTAL_TIMEOUT:
+            print(f"   ⚠️  A single retrying HTTP call ({worst_http:.0f}s) can outlast the"
+                  f" {DOC_TOTAL_TIMEOUT}s document budget.")
+            print(f"   ⚠️  Retries run inside one request, where the budget cannot stop"
+                  f" them. Lower HTTP_RETRY_TOTAL or REQUEST_TIMEOUT_SECONDS.")
+        if HTTP_RESPECT_RETRY_AFTER:
+            print(f"   ℹ️  A 429 with a long Retry-After header can still exceed all of"
+                  f" the above; set HTTP_RESPECT_RETRY_AFTER=0 to cap it.")
+    print("=" * 80)
 session = requests.Session()
 session.headers.update(headers)
-retry_strategy = Retry(
-    total=5,
-    backoff_factor=0.5,
+# backoff_max only became a Retry kwarg in urllib3 2.x; older versions use the
+# Retry.BACKOFF_MAX class attribute instead.
+_retry_kwargs = dict(
+    total=HTTP_RETRY_TOTAL,
+    backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
     status_forcelist=(429, 500, 502, 503, 504),
     allowed_methods=("GET", "PATCH"),
+    respect_retry_after_header=HTTP_RESPECT_RETRY_AFTER,
 )
+if "backoff_max" in inspect.signature(Retry.__init__).parameters:
+    _retry_kwargs["backoff_max"] = HTTP_RETRY_BACKOFF_MAX
+else:  # urllib3 1.x
+    Retry.BACKOFF_MAX = HTTP_RETRY_BACKOFF_MAX
+retry_strategy = Retry(**_retry_kwargs)
 adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=16, pool_maxsize=32)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
@@ -254,25 +477,26 @@ def not_pdf_to_images_webp_libreoffice(
     quality=15,
     max_width=800,
     max_slides=DEFAULT_MAX_SLIDES,
+    deadline=None,
 ):
     file_name = os.path.basename(ppt_path)
     file_size_mb = os.path.getsize(ppt_path) / (1024 * 1024)
     
-    # Calculate dynamic timeout based on file size (minimum 120s, add 15s per MB)
-    # Large files need more time to convert
-    dynamic_timeout = max(120, LIBREOFFICE_TIMEOUT + int(file_size_mb * 15))
-    if dynamic_timeout > LIBREOFFICE_TIMEOUT:
-        print(f"\n{'='*80}")
-        print(f"🔄 Starting conversion: {file_name}")
-        print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
-        print(f"⏱️  Timeout adjusted: {LIBREOFFICE_TIMEOUT}s → {dynamic_timeout}s (based on file size)")
-        print(f"{'='*80}")
-    else:
-        print(f"\n{'='*80}")
-        print(f"🔄 Starting conversion: {file_name}")
-        print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB | Timeout: {LIBREOFFICE_TIMEOUT}s")
-        print(f"{'='*80}")
-        dynamic_timeout = LIBREOFFICE_TIMEOUT
+    # Size-scaled budget, all knobs from .env (see compute_conversion_timeout)
+    dynamic_timeout = compute_conversion_timeout(file_size_mb)
+    budget = budget_left(deadline, f"conversion of {file_name}")
+    trimmed = budget is not None and budget < dynamic_timeout
+
+    print(f"\n{'='*80}")
+    print(f"🔄 Starting conversion: {file_name}")
+    print(f"📊 File size: {file_size_mb:.2f}MB | Memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB")
+    print(f"⏱️  Timeout: {dynamic_timeout}s (base {LIBREOFFICE_TIMEOUT}s + {LIBREOFFICE_TIMEOUT_PER_MB}s/MB, "
+          f"min {LIBREOFFICE_TIMEOUT_MIN}s, max {str(LIBREOFFICE_TIMEOUT_MAX) + 's' if LIBREOFFICE_TIMEOUT_MAX else 'unlimited'})")
+    if trimmed:
+        dynamic_timeout = max(1, int(budget))
+        print(f"⏱️  Trimmed to {dynamic_timeout}s — only that much of the "
+              f"{DOC_TOTAL_TIMEOUT}s document budget is left")
+    print(f"{'='*80}")
     
     abs_ppt = os.path.abspath(ppt_path)
     abs_output = tempfile.mkdtemp(prefix="libreoffice_out_", dir=LOCAL_TMP_DIR)
@@ -323,19 +547,24 @@ def not_pdf_to_images_webp_libreoffice(
     if running_count > 0:
         print(f"📊 Currently running LibreOffice processes: {running_count}")
     
-    print(f"📊 LibreOffice memory limit: {LIBREOFFICE_MEMORY_LIMIT_MB}MB, timeout: {dynamic_timeout}s")
     print(f"🚀 Launching LibreOffice process...")
     
+    stdout_capture = tempfile.TemporaryFile(mode="w+", dir=LOCAL_TMP_DIR)
+    stderr_capture = tempfile.TemporaryFile(mode="w+", dir=LOCAL_TMP_DIR)
+
     process_start_time = time.time()
     process = None
     process_pid = None
     
     try:
         # Use Popen to monitor process in real-time
+        # Output goes to temp files, NOT subprocess.PIPE: nothing drains a pipe
+        # while we poll, so a chatty conversion filled the 64KB buffer, blocked
+        # on write and then got killed at the timeout even though it was healthy.
         process = subprocess.Popen(
             soffice_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=stdout_capture,
+            stderr=stderr_capture,
             text=True,
             preexec_fn=make_process_limiter(dynamic_timeout),
             env=env
@@ -344,7 +573,7 @@ def not_pdf_to_images_webp_libreoffice(
         print(f"✅ LibreOffice process started | PID: {process_pid}")
         
         # Monitor process with periodic updates
-        check_interval = 5  # Check every 5 seconds
+        check_interval = LIBREOFFICE_PROGRESS_INTERVAL  # from .env
         last_check = 0
         
         while process.poll() is None:
@@ -364,7 +593,7 @@ def not_pdf_to_images_webp_libreoffice(
                 kill_all_libreoffice_processes(profile_dir, process_pid)
                 
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=LIBREOFFICE_KILL_WAIT)
                 except subprocess.TimeoutExpired:
                     print(f"⚠️  Process did not terminate within wait timeout")
                 
@@ -385,8 +614,12 @@ def not_pdf_to_images_webp_libreoffice(
         elapsed_total = time.time() - process_start_time
         print(f"✅ Process completed in {elapsed_total:.1f}s | Exit code: {process.returncode}")
         
-        # Get stdout and stderr
-        stdout, stderr = process.communicate()
+        # Read back what the child wrote to the capture files
+        process.wait()
+        stdout_capture.seek(0)
+        stderr_capture.seek(0)
+        stdout = stdout_capture.read()
+        stderr = stderr_capture.read()
         
         if stdout:
             print(f"📤 STDOUT: {stdout[:500]}{'...' if len(stdout) > 500 else ''}")
@@ -429,6 +662,11 @@ def not_pdf_to_images_webp_libreoffice(
             try:
                 kill_all_libreoffice_processes(profile_dir, process_pid)
             except:
+                pass
+        for capture in (stdout_capture, stderr_capture):
+            try:
+                capture.close()
+            except Exception:
                 pass
 
     try:
@@ -495,6 +733,7 @@ def not_pdf_to_images_webp_libreoffice(
             dpi=PDF_DPI,
             first_page=1,
             last_page=max_slides,
+            **raster_kwargs(deadline, "slide rasterization"),
         )
         print(f"✅ Extracted {len(pages)} page(s)")
         
@@ -545,6 +784,7 @@ def pdf_to_images_webp(
     quality=60,
     max_width=None,
     max_pages=DEFAULT_MAX_PDF_PAGES,
+    deadline=None,
 ):
     os.makedirs(output_folder, exist_ok=True)
     total_pages = get_pdf_page_count(pdf_path)
@@ -553,6 +793,7 @@ def pdf_to_images_webp(
         first_page=1,
         last_page=max_pages,
         dpi=PDF_DPI,
+        **raster_kwargs(deadline, "pdf rasterization"),
     )
 
     for i, img in enumerate(images):
@@ -570,13 +811,22 @@ def pdf_to_images_webp(
     )
 
 
-def download_file(file_url, save_path):
-    with session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+def download_file(file_url, save_path, deadline=None):
+    timeout = stage_timeout(deadline, "download", REQUEST_TIMEOUT)
+    with session.get(file_url, stream=True, timeout=timeout) as response:
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                 if chunk:
                     f.write(chunk)
+                    # REQUEST_TIMEOUT is per-read, so a slow-but-steady trickle
+                    # could outlast the whole document budget without it ever
+                    # timing out. Check the deadline as the bytes arrive.
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise DocumentDeadlineExceeded(
+                            f"document budget of {DOC_TOTAL_TIMEOUT}s exhausted "
+                            f"mid-download ({os.path.getsize(save_path) / (1024*1024):.1f}MB fetched)"
+                        )
 
 
 from lxml import etree as ET
@@ -622,7 +872,7 @@ def clean_xml_references(temp_dir: str, missing_files: list[str]):
                     print(f"⚠️ Failed to clean {xml_path}: {e}")
 
 
-def try_repair_office_file(path: str) -> str | None:
+def try_repair_office_file(path: str, deadline=None) -> str | None:
     """
     Repair corrupted Office file (pptx/docx).
     - For pptx/docx: replace broken images with placeholders and clean XML references.
@@ -632,6 +882,16 @@ def try_repair_office_file(path: str) -> str | None:
     # Handle old .ppt files by converting to .pptx first
     if path.lower().endswith(".ppt") and not path.lower().endswith(".pptx"):
         pptx_path = path.replace(".ppt", ".pptx")
+        # Same size-scaled budget as the main conversion: an old .ppt big enough
+        # to need repairing is exactly the case the static 180s was too short for.
+        try:
+            repair_timeout = compute_conversion_timeout(os.path.getsize(path) / (1024 * 1024))
+        except OSError:
+            repair_timeout = LIBREOFFICE_TIMEOUT
+        repair_budget = budget_left(deadline, "ppt→pptx repair")
+        if repair_budget is not None:
+            repair_timeout = max(1, int(min(repair_timeout, repair_budget)))
+        print(f"⏱️  PPT→PPTX repair timeout: {repair_timeout}s")
         try:
             # Create temporary profile for this conversion using local temp dir
             temp_profile = tempfile.mkdtemp(prefix="libreoffice_profile_", dir=LOCAL_TMP_DIR)
@@ -663,8 +923,8 @@ def try_repair_office_file(path: str) -> str | None:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=LIBREOFFICE_TIMEOUT,
-                    preexec_fn=make_process_limiter(LIBREOFFICE_TIMEOUT),
+                    timeout=repair_timeout,
+                    preexec_fn=make_process_limiter(repair_timeout),
                     env=env
                 )
                 if process.returncode != 0:
@@ -755,6 +1015,11 @@ def generate_docs_for_soff(doc_id):
     temp_path = None
     output_folder = None
     success = False
+    # Whole-document clock; every stage below is capped by what is left of it.
+    deadline = make_deadline()
+    doc_start = time.monotonic()
+    if deadline is not None:
+        print(f"⏱️  Document budget: {DOC_TOTAL_TIMEOUT}s total")
     try:
         print(f"\n{'#'*80}")
         print(f"🆔 Processing document ID: {doc_id}")
@@ -763,7 +1028,7 @@ def generate_docs_for_soff(doc_id):
         response = session.get(
             f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/',
             stream=True,
-            timeout=REQUEST_TIMEOUT,
+            timeout=stage_timeout(deadline, "metadata fetch", REQUEST_TIMEOUT),
         )
         response.raise_for_status()
         data = response.json()
@@ -788,7 +1053,7 @@ def generate_docs_for_soff(doc_id):
         print(f"📥 Downloading file from: {file_url}")
         print(f"💾 Saving to: {temp_path}")
         download_start = time.time()
-        download_file(file_url, temp_path)
+        download_file(file_url, temp_path, deadline=deadline)
         download_time = time.time() - download_start
         file_size = os.path.getsize(temp_path) / (1024 * 1024)
         print(f"✅ Download completed in {download_time:.1f}s | File size: {file_size:.2f}MB")
@@ -800,12 +1065,17 @@ def generate_docs_for_soff(doc_id):
                     output_folder,
                     quality=85,
                     max_width=1600,
+                    deadline=deadline,
                 )
 
+            except DocumentDeadlineExceeded:
+                # Out of time is not corruption -- repairing and retrying would
+                # only blow the budget further. Let the outer handler record it.
+                raise
             except Exception as e:
                 print(f"\n❌ LibreOffice failed on {temp_path}: {e}")
                 print(f"🔧 Attempting to repair file...")
-                repaired = try_repair_office_file(temp_path)
+                repaired = try_repair_office_file(temp_path, deadline=deadline)
                 if repaired:
                     print(f"✅ File repaired: {repaired}")
                     print(f"🔄 Retrying conversion with repaired file...")
@@ -815,8 +1085,11 @@ def generate_docs_for_soff(doc_id):
                             output_folder,
                             quality=85,
                             max_width=1600,
+                            deadline=deadline,
                         )
                         print(f"✅ Successfully processed repaired file: {len(image_paths)} image(s)")
+                    except DocumentDeadlineExceeded:
+                        raise
                     except Exception as e2:
                         print(f"❌ Repair attempt also failed: {e2}")
                         print(f"🗑️  Cleaning up files...")
@@ -856,6 +1129,7 @@ def generate_docs_for_soff(doc_id):
                 temp_path,
                 output_folder,
                 quality=85, max_width=1600,
+                deadline=deadline,
             )
         else:
             return True
@@ -881,6 +1155,10 @@ def generate_docs_for_soff(doc_id):
                 f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
                 files=files,
                 data=data,
+                # The images already exist by now, so refusing to upload would
+                # throw away the whole conversion. The upload always gets its
+                # own full timeout; it can overshoot the document budget by at
+                # most REQUEST_TIMEOUT_SECONDS.
                 timeout=REQUEST_TIMEOUT,
             )
             # Without this an upload that 500s still printed "COMPLETED"
@@ -897,7 +1175,15 @@ def generate_docs_for_soff(doc_id):
         success = True
         print(f"\n{'='*80}")
         print(f"✅ COMPLETED doc_id={doc_id}")
+        print(f"⏱️  Total time: {time.monotonic() - doc_start:.1f}s")
         print(f"{'='*80}\n")
+
+    except DocumentDeadlineExceeded as e:
+        elapsed = time.monotonic() - doc_start
+        print("\n" + "=" * 80)
+        print(f"⏱️  BUDGET EXCEEDED for doc_id={doc_id} after {elapsed:.0f}s: {e}")
+        print("=" * 80)
+        record_failure(doc_id, f"doc budget exceeded after {elapsed:.0f}s: {e}")
 
     except Exception as e:
         print(f"\n{'='*80}")
@@ -971,5 +1257,6 @@ def process_doc_poster_generate_queue(limit=None, workers=None, start_id=None):
 
 
 if __name__ == "__main__":
-    workers_env = int(os.environ.get("WORKER_COUNT", "4"))
+    log_timeout_config()
+    workers_env = env_int("WORKER_COUNT", 4)
     process_doc_poster_generate_queue(workers=workers_env)
