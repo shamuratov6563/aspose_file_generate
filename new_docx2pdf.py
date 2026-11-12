@@ -717,8 +717,18 @@ def not_pdf_to_images_webp_libreoffice(
         if stdout:
             print(f"📤 STDOUT: {stdout[:500]}{'...' if len(stdout) > 500 else ''}")
         if stderr:
-            print(f"📤 STDERR: {stderr[:500]}{'...' if len(stderr) > 500 else ''}")
-        
+            head = stderr.split("Stack:", 1)[0] if "Stack:" in stderr else stderr
+            print(f"📤 STDERR: {head[:500]}{'...' if len(head) > 500 else ''}")
+            if "Stack:" in stderr:
+                print(f"   (LibreOffice backtrace omitted)")
+
+        # `soffice` is a shell wrapper around soffice.bin, so a fatal signal in
+        # the child surfaces as 128 + signal rather than a negative returncode.
+        if process.returncode in (134, 139, -6, -11):
+            signal_name = "SIGABRT" if process.returncode in (134, -6) else "SIGSEGV"
+            print(f"\n💥 LibreOffice died on {signal_name} (exit {process.returncode}) -- "
+                  f"the document defeated the importer, the file itself is fine.")
+
         # Check for memory limit violations (signal 9 = SIGKILL, signal 11 = SIGSEGV)
         if process.returncode == -9 or (stderr and ('Killed' in stderr or 'SIGKILL' in stderr)):
             print(f"\n⚠️  MEMORY LIMIT VIOLATION DETECTED!")
@@ -777,6 +787,13 @@ def not_pdf_to_images_webp_libreoffice(
         # (Java warnings can cause non-zero exit codes even when conversion succeeds)
         if not pdf_candidates:
             error_msg = result.stderr or result.stdout or "Unknown error"
+            # A crash dumps 50+ stack frames into stderr, and this message is
+            # printed again by every caller up the chain. The signature that
+            # matters (is_libreoffice_crash reads it) is in the opening lines,
+            # so keep those and drop the backtrace.
+            if "Stack:" in error_msg:
+                error_msg = error_msg.split("Stack:", 1)[0].strip() + " [backtrace omitted]"
+            error_msg = " ".join(error_msg.split())[:400]
             print(f"\n❌ No PDF file generated!")
             print(f"🧹 Cleaning up temporary directories...")
             
@@ -963,6 +980,234 @@ def clean_xml_references(temp_dir: str, missing_files: list[str]):
                     tree.write(xml_path)
                 except Exception as e:
                     print(f"⚠️ Failed to clean {xml_path}: {e}")
+
+
+def is_libreoffice_crash(error: BaseException) -> bool:
+    """
+    True when LibreOffice died on a fatal signal instead of rejecting the file.
+
+    A crash means the document defeated the importer, so re-zipping it is
+    pointless -- the retry has to make the document smaller. Corruption, a
+    missing filter and friends come back as ordinary messages and keep going
+    down the repair path.
+    """
+    text = str(error).lower()
+    return any(marker in text for marker in (
+        "fatal exception",            # LibreOffice's own crash banner
+        "signal 6",                   # SIGABRT
+        "signal 11",                  # SIGSEGV
+        "pure virtual method called",
+        "terminate called",
+        "unspecified application error",
+        "std::bad_alloc",
+        "exceeded memory limit",
+    ))
+
+
+def _top_level_elements(xml: str, start: int, end: int):
+    """
+    Yield (name, begin, finish) offsets for each top-level element in
+    xml[start:end].
+
+    A hand-rolled scanner rather than ElementTree: word/document.xml carries
+    some forty namespace declarations on <w:document> plus an mc:Ignorable list
+    that has to keep matching them, and ElementTree renames prefixes when it
+    writes. Working in offsets means every byte outside the cut is preserved
+    exactly as Word wrote it.
+    """
+    i = start
+    depth = 0
+    open_name = None
+    open_at = 0
+
+    while i < end:
+        lt = xml.find("<", i)
+        if lt < 0 or lt >= end:
+            break
+
+        # Skip the constructs that are not elements.
+        if xml.startswith("<!--", lt):
+            nxt = xml.find("-->", lt)
+            i = end if nxt < 0 else nxt + 3
+            continue
+        if xml.startswith("<![CDATA[", lt):
+            nxt = xml.find("]]>", lt)
+            i = end if nxt < 0 else nxt + 3
+            continue
+        if xml.startswith("<?", lt) or xml.startswith("<!", lt):
+            nxt = xml.find(">", lt)
+            i = end if nxt < 0 else nxt + 1
+            continue
+
+        # Walk to the tag's closing '>', ignoring one inside an attribute value.
+        j = lt + 1
+        quote = ""
+        while j < end:
+            ch = xml[j]
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in "\"'":
+                quote = ch
+            elif ch == ">":
+                break
+            j += 1
+        if j >= end:
+            break
+
+        tag = xml[lt:j + 1]
+        match = re.match(r"</?([^\s/>]+)", tag)
+        if match is None:
+            i = j + 1
+            continue
+        name = match.group(1)
+
+        if tag.startswith("</"):
+            depth -= 1
+            if depth == 0 and open_name is not None:
+                yield open_name, open_at, j + 1
+                open_name = None
+        elif tag.endswith("/>"):
+            if depth == 0:
+                yield name, lt, j + 1
+        else:
+            if depth == 0:
+                open_name, open_at = name, lt
+            depth += 1
+
+        i = j + 1
+
+
+def truncate_docx_for_preview(path: str, max_pages: int) -> tuple[str, int, int] | None:
+    """
+    Write a copy of `path` keeping only the opening stretch of its body.
+
+    Returns (new_path, kept_blocks, total_blocks), or None when the file is not
+    a docx, cannot be parsed, or is already small enough that truncating would
+    not buy anything.
+
+    The trailing <w:sectPr> is always carried over: it holds the page size and
+    margins for the final section, and dropping it would let LibreOffice fall
+    back to its own defaults and re-flow the very pages we are previewing.
+    """
+    if not path.lower().endswith((".docx", ".doc")) or not zipfile.is_zipfile(path):
+        return None
+
+    keep = max(PREVIEW_TRUNCATE_MIN_BLOCKS, max_pages * PREVIEW_TRUNCATE_BLOCKS_PER_PAGE)
+
+    try:
+        with zipfile.ZipFile(path, "r") as src:
+            names = src.namelist()
+            if "word/document.xml" not in names:
+                return None
+            document = src.read("word/document.xml").decode("utf-8", "replace")
+
+        body_open = re.search(r"<w:body(?:\s[^>]*)?>", document)
+        body_close = document.rfind("</w:body>")
+        if body_open is None or body_close < body_open.end():
+            print("⚠️  No <w:body> found, cannot truncate")
+            return None
+
+        blocks = list(_top_level_elements(document, body_open.end(), body_close))
+        content = [b for b in blocks if b[0] != "w:sectPr"]
+        sect_pr = [b for b in blocks if b[0] == "w:sectPr"]
+        total = len(content)
+
+        # Only worth it with plenty to spare -- otherwise the cut could land
+        # inside the pages we need.
+        if total <= keep * 2:
+            print(f"ℹ️  Body has {total} block(s), not enough to truncate "
+                  f"(need more than {keep * 2})")
+            return None
+
+        kept_xml = document[content[0][1]:content[keep - 1][2]]
+        tail_xml = "".join(document[b[1]:b[2]] for b in sect_pr)
+        new_document = (
+            document[:body_open.end()]
+            + kept_xml
+            + tail_xml
+            + document[body_close:]
+        )
+
+        base, ext = os.path.splitext(path)
+        new_path = f"{base}_preview{ext}"
+        with zipfile.ZipFile(path, "r") as src, \
+                zipfile.ZipFile(new_path, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                if item.filename == "word/document.xml":
+                    dst.writestr(item, new_document.encode("utf-8"))
+                else:
+                    dst.writestr(item, src.read(item.filename))
+
+        before = len(document) / (1024 * 1024)
+        after = len(new_document) / (1024 * 1024)
+        print(f"✂️  Truncated preview copy: {kept_xml.count('<w:p ') + kept_xml.count('<w:p>')} "
+              f"paragraph tags kept of {total} block(s) "
+              f"| document.xml {before:.2f}MB → {after:.2f}MB")
+        print(f"   💾 {new_path}")
+        return new_path, keep, total
+
+    except Exception as exc:
+        print(f"⚠️  Could not build truncated copy of {path}: {exc!r}")
+        return None
+
+
+def scale_truncated_page_count(preview_pages: int, kept_blocks: int, total_blocks: int) -> int:
+    """
+    Estimate the whole document's page count from a truncated render.
+
+    The truncated PDF ends mid-page, so its last page is only partly filled;
+    counting it whole would inflate the estimate by one page per multiple.
+    Half a page is the expected overshoot, so that is what comes off before
+    scaling back up. The result is an estimate and nothing more -- it is only
+    used for documents that cannot be laid out in full at all.
+    """
+    if preview_pages <= 0 or kept_blocks <= 0 or total_blocks <= kept_blocks:
+        return max(preview_pages, 0)
+    ratio = total_blocks / kept_blocks
+    return max(preview_pages, int(round((preview_pages - 0.5) * ratio)))
+
+
+def convert_via_truncated_copy(path: str, output_folder: str, deadline=None):
+    """
+    Second chance for a document LibreOffice crashed on: convert a copy that
+    holds only the pages we preview.
+
+    Returns (image_paths, estimated_page_count) on success, or None when the
+    file cannot be truncated or the truncated copy fails too. The page count is
+    extrapolated -- the only alternative for these documents is no preview.
+    """
+    truncated = truncate_docx_for_preview(path, DEFAULT_MAX_SLIDES)
+    if not truncated:
+        return None
+
+    preview_path, kept_blocks, total_blocks = truncated
+    try:
+        image_paths, preview_pages = not_pdf_to_images_webp_libreoffice(
+            preview_path,
+            output_folder,
+            quality=85,
+            max_width=1600,
+            deadline=deadline,
+        )
+        pages_count = scale_truncated_page_count(preview_pages, kept_blocks, total_blocks)
+        print(f"✅ Preview built from truncated copy: {len(image_paths)} image(s)")
+        print(f"   📊 Rendered {preview_pages} page(s) from {kept_blocks} of "
+              f"{total_blocks} block(s) → page count estimated at {pages_count}")
+        if len(image_paths) < DEFAULT_MAX_SLIDES:
+            print(f"   ⚠️  Only {len(image_paths)} preview image(s); the truncated copy "
+                  f"renders shorter than the {DEFAULT_MAX_SLIDES} pages asked for. "
+                  f"Raise PREVIEW_TRUNCATE_BLOCKS_PER_PAGE to keep more.")
+        return image_paths, pages_count
+    except DocumentDeadlineExceeded:
+        raise
+    except Exception as exc:
+        print(f"❌ Truncated copy failed as well: {exc}")
+        return None
+    finally:
+        if os.path.exists(preview_path):
+            os.remove(preview_path)
+            print(f"🗑️  Deleted truncated copy: {preview_path}")
 
 
 def try_repair_office_file(path: str, deadline=None) -> str | None:
@@ -1168,47 +1413,66 @@ def generate_docs_for_soff(job):
                 raise
             except Exception as e:
                 print(f"\n❌ LibreOffice failed on {temp_path}: {e}")
-                print(f"🔧 Attempting to repair file...")
-                repaired = try_repair_office_file(temp_path, deadline=deadline)
-                if repaired:
-                    print(f"✅ File repaired: {repaired}")
-                    print(f"🔄 Retrying conversion with repaired file...")
-                    try:
-                        image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
-                            repaired,
-                            output_folder,
-                            quality=85,
-                            max_width=1600,
-                            deadline=deadline,
-                        )
-                        print(f"✅ Successfully processed repaired file: {len(image_paths)} image(s)")
-                    except DocumentDeadlineExceeded:
-                        raise
-                    except Exception as e2:
-                        print(f"❌ Repair attempt also failed: {e2}")
+
+                # A fatal signal means the importer gave up on the document,
+                # not that the bytes are damaged. try_repair_office_file only
+                # unzips and re-zips the file, so it hands LibreOffice the same
+                # document and crashes identically -- twice the budget, same
+                # failure. Shrink the document to the previewed pages instead.
+                truncated_result = None
+                if PREVIEW_TRUNCATE_ENABLED and is_libreoffice_crash(e):
+                    print(f"✂️  LibreOffice crashed on a fatal signal, so the file is "
+                          f"not corrupt -- it is too heavy to lay out.")
+                    print(f"🔄 Retrying with a copy cut down to the first "
+                          f"{DEFAULT_MAX_SLIDES} preview page(s)...")
+                    truncated_result = convert_via_truncated_copy(
+                        temp_path, output_folder, deadline=deadline
+                    )
+
+                if truncated_result is not None:
+                    image_paths, pages_count = truncated_result
+                else:
+                    print(f"🔧 Attempting to repair file...")
+                    repaired = try_repair_office_file(temp_path, deadline=deadline)
+                    if repaired:
+                        print(f"✅ File repaired: {repaired}")
+                        print(f"🔄 Retrying conversion with repaired file...")
+                        try:
+                            image_paths, pages_count = not_pdf_to_images_webp_libreoffice(
+                                repaired,
+                                output_folder,
+                                quality=85,
+                                max_width=1600,
+                                deadline=deadline,
+                            )
+                            print(f"✅ Successfully processed repaired file: {len(image_paths)} image(s)")
+                        except DocumentDeadlineExceeded:
+                            raise
+                        except Exception as e2:
+                            print(f"❌ Repair attempt also failed: {e2}")
+                            print(f"🗑️  Cleaning up files...")
+                            if os.path.exists(repaired):
+                                os.remove(repaired)
+                                print(f"   🗑️  Deleted: {repaired}")
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                                print(f"   🗑️  Deleted: {temp_path}")
+                            if os.path.exists(output_folder):
+                                shutil.rmtree(output_folder, ignore_errors=True)
+                                print(f"   🗑️  Deleted: {output_folder}")
+                            record_failure(doc_id, f"repair+convert failed: {e2!r}")
+                            return False
+                    else:
+                        print(f"❌ Could not repair file, skipping doc_id={doc_id}")
                         print(f"🗑️  Cleaning up files...")
-                        if os.path.exists(repaired):
-                            os.remove(repaired)
-                            print(f"   🗑️  Deleted: {repaired}")
                         if os.path.exists(temp_path):
                             os.remove(temp_path)
                             print(f"   🗑️  Deleted: {temp_path}")
                         if os.path.exists(output_folder):
                             shutil.rmtree(output_folder, ignore_errors=True)
                             print(f"   🗑️  Deleted: {output_folder}")
-                        record_failure(doc_id, f"repair+convert failed: {e2!r}")
+                        record_failure(doc_id, f"unrepairable: {e!r}")
                         return False
-                else:
-                    print(f"❌ Could not repair file, skipping doc_id={doc_id}")
-                    print(f"🗑️  Cleaning up files...")
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                        print(f"   🗑️  Deleted: {temp_path}")
-                    if os.path.exists(output_folder):
-                        shutil.rmtree(output_folder, ignore_errors=True)
-                        print(f"   🗑️  Deleted: {output_folder}")
-                    record_failure(doc_id, f"unrepairable: {e!r}")
-                    return False
             finally:
                 print(f"\n🧹 Final cleanup of temporary files...")
                 if repaired and os.path.exists(repaired):
