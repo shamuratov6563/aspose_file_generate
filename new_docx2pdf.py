@@ -1,5 +1,6 @@
 import glob
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -175,6 +176,29 @@ LIBREOFFICE_TIMEOUT_MAX = env_int("LIBREOFFICE_TIMEOUT_MAX_SECONDS", 1800)      
 LIBREOFFICE_PROGRESS_INTERVAL = max(1, env_int("LIBREOFFICE_PROGRESS_INTERVAL_SECONDS", 5))
 LIBREOFFICE_KILL_WAIT = max(1, env_int("LIBREOFFICE_KILL_WAIT_SECONDS", 5))
 LIBREOFFICE_MEMORY_LIMIT_MB = env_int("LIBREOFFICE_MEMORY_LIMIT_MB", 3072)      # 3GB default for Ubuntu reliability
+
+# ---------------------------------------------------------------------------
+# Preview truncation (the SIGABRT / exit-134 escape hatch)
+# ---------------------------------------------------------------------------
+# Some documents are far too heavy for LibreOffice to lay out at all. The
+# 600-test study guides are ~12 000 paragraphs with ~8 600 OMML formulas in a
+# 4.8MB word/document.xml; every formula becomes an embedded Starmath object,
+# memory runs out mid-import and the process aborts while tearing the document
+# down -- "pure virtual method called" / "Fatal exception: Signal 6", exit code
+# 134, no PDF at all. Re-zipping the file (try_repair_office_file) cannot help,
+# because nothing is corrupt: the document is simply too big.
+#
+# Only the first DEFAULT_MAX_SLIDES pages ever become previews, so when a
+# conversion dies this way we retry with a copy holding just the opening
+# stretch of the body. That bounds the import to a few hundred paragraphs and
+# converts in seconds.
+PREVIEW_TRUNCATE_ENABLED = env_bool("PREVIEW_TRUNCATE_ENABLED", True)
+# Blocks to keep per previewed page. A block-level child (paragraph or table)
+# always occupies at least one line, so N blocks can never render shorter than
+# N / lines-per-page pages -- 100 per page is a wide margin over any realistic
+# line count, and the caller still re-checks the page count it actually got.
+PREVIEW_TRUNCATE_BLOCKS_PER_PAGE = max(1, env_int("PREVIEW_TRUNCATE_BLOCKS_PER_PAGE", 100))
+PREVIEW_TRUNCATE_MIN_BLOCKS = max(1, env_int("PREVIEW_TRUNCATE_MIN_BLOCKS", 300))
 
 
 def compute_conversion_timeout(file_size_mb: float) -> int:
