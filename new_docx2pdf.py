@@ -72,10 +72,11 @@ def env_str(name: str, default: str = "") -> str:
 
 # Access environment variables
 BASE_URL = os.getenv("BASE_URL")
-# Shared secret for the poster-generation service API. This replaces the old
-# superuser Bearer token: the service endpoints only expose moderation-queue
-# documents and only accept poster images, so a leaked key here cannot edit
-# prices, approve products or read seller data the way the admin token could.
+# Shared secret for the poster-generation service API; must match
+# POSTER_SERVICE_SECRET_KEY on the Soff server. This replaces the old superuser
+# Bearer token: the service endpoints only expose moderation-queue documents and
+# only accept poster images, so a leaked key here cannot edit prices, approve
+# products or read seller data the way the admin token could.
 SECRET_KEY = env_str("SECRET_KEY")
 # Legacy: only still used if SERVICE_API=0 pins the run to the old admin API.
 TOKEN = os.getenv("TOKEN")
@@ -117,9 +118,10 @@ FAILED_LOG = os.getenv("FAILED_LOG", os.path.join(os.getcwd(), "failed_doc_ids.l
 if USE_SERVICE_API:
     if not SECRET_KEY:
         raise SystemExit(
-            "SECRET_KEY is required: it is the X-Secret-Key for the poster service API"
-            " (SECURE_KEY on the Soff server). Set SERVICE_API=0 to fall back to the"
-            " old admin API with TOKEN."
+            "SECRET_KEY is required: it is the X-Secret-Key for the poster service"
+            " API, and must match POSTER_SERVICE_SECRET_KEY on the Soff server (not"
+            " its SECURE_KEY). Set SERVICE_API=0 to fall back to the old admin API"
+            " with TOKEN."
         )
     headers = {"X-Secret-Key": SECRET_KEY}
 else:
