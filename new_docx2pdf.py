@@ -140,6 +140,9 @@ LEGACY_DETAIL_URL = f"{BASE_URL}/api/v1/seller/admin/product-list/{{doc_id}}/"
 
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT_SECONDS", 120)
 DOWNLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB chunks for large files
+# Whole-transfer attempts for one download. urllib3's Retry cannot cover a
+# connection that dies while the body streams (see download_file).
+DOWNLOAD_ATTEMPTS = max(1, env_int("DOWNLOAD_ATTEMPTS", 3))
 DEFAULT_MAX_SLIDES = 4
 DEFAULT_MAX_PDF_PAGES = 3
 PDF_DPI = 300
@@ -922,21 +925,63 @@ def pdf_to_images_webp(
 
 
 def download_file(file_url, save_path, deadline=None):
-    timeout = stage_timeout(deadline, "download", REQUEST_TIMEOUT)
-    with download_session.get(file_url, stream=True, timeout=timeout) as response:
-        response.raise_for_status()
-        with open(save_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                if chunk:
-                    f.write(chunk)
-                    # REQUEST_TIMEOUT is per-read, so a slow-but-steady trickle
-                    # could outlast the whole document budget without it ever
-                    # timing out. Check the deadline as the bytes arrive.
-                    if deadline is not None and time.monotonic() > deadline:
-                        raise DocumentDeadlineExceeded(
-                            f"document budget of {DOC_TOTAL_TIMEOUT}s exhausted "
-                            f"mid-download ({os.path.getsize(save_path) / (1024*1024):.1f}MB fetched)"
-                        )
+    """Fetch file_url to save_path, verifying that all of it arrived.
+
+    urllib3's Retry cannot help here: it retries the *request*, and the body
+    streams in after the response object is handed back, so a connection that
+    dies mid-transfer surfaces in iter_content instead. A short read does not
+    reliably raise either, and a truncated .pdf or .pptx then fails much later
+    as a baffling conversion error rather than a download error. So compare
+    what arrived against Content-Length and retry the whole transfer when they
+    disagree -- these files run to tens of megabytes, where a dropped stream is
+    a routine event rather than a freak one.
+    """
+    last_error = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        timeout = stage_timeout(deadline, "download", REQUEST_TIMEOUT)
+        written = 0
+        expected = None
+        try:
+            with download_session.get(file_url, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                length = response.headers.get("Content-Length")
+                expected = int(length) if length and length.isdigit() else None
+                with open(save_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+                            # REQUEST_TIMEOUT is per-read, so a slow-but-steady
+                            # trickle could outlast the whole document budget
+                            # without it ever timing out. Check the deadline as
+                            # the bytes arrive.
+                            if deadline is not None and time.monotonic() > deadline:
+                                raise DocumentDeadlineExceeded(
+                                    f"document budget of {DOC_TOTAL_TIMEOUT}s exhausted "
+                                    f"mid-download ({written / (1024*1024):.1f}MB fetched)"
+                                )
+            if expected is not None and written != expected:
+                raise IOError(
+                    f"truncated download: {written} of {expected} bytes "
+                    f"({written / max(expected, 1):.0%}) -- the file on S3 is fine, "
+                    f"the transfer was cut short"
+                )
+            return
+        except DocumentDeadlineExceeded:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= DOWNLOAD_ATTEMPTS:
+                break
+            print(
+                f"⚠️  Download attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed: {exc}"
+                f" -- retrying from the start"
+            )
+            # Nothing is resumable here (no Range request), so a retry re-reads
+            # the whole file; stop if the budget cannot pay for another pass.
+            budget_left(deadline, "download retry")
+            time.sleep(min(2 ** (attempt - 1), 5))
+    raise last_error
 
 
 from lxml import etree as ET
