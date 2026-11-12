@@ -9,6 +9,7 @@ import tempfile
 import time
 import zipfile
 from contextlib import ExitStack
+from datetime import datetime
 from multiprocessing import Process, Queue, cpu_count
 from queue import Empty
 
@@ -107,6 +108,22 @@ if QUEUE_ORDER not in VALID_QUEUE_ORDERS:
 # Failed ids are sent back as `exclude_ids` and, past that cap, stepped over
 # with `offset`.
 QUEUE_MAX_EXCLUDE_IDS = env_int("QUEUE_MAX_EXCLUDE_IDS", 500)
+# Skip everything uploaded before this date -- `2026-11-01`, or a full ISO
+# timestamp. Empty leaves the choice to the server's POSTER_QUEUE_CREATED_AFTER.
+# The oldest end of the queue is where documents that cannot be rendered
+# collect: a document that fails never gets a poster, so it never leaves the
+# queue, and a run with no cut-off spends its first hours re-failing the same
+# backlog. Validated here so a typo stops the run at startup instead of turning
+# every queue request into a 400.
+QUEUE_CREATED_AFTER = env_str("QUEUE_CREATED_AFTER", "").strip()
+if QUEUE_CREATED_AFTER:
+    try:
+        datetime.fromisoformat(QUEUE_CREATED_AFTER)
+    except ValueError:
+        raise SystemExit(
+            f"QUEUE_CREATED_AFTER={QUEUE_CREATED_AFTER!r} is not a date "
+            f"(2026-11-01) or an ISO timestamp (2026-11-01T00:00:00)"
+        )
 
 # Define a local temporary directory to bypass Snap sandboxing which often prevents access to system /tmp
 LOCAL_TMP_DIR = os.path.join(os.getcwd(), 'tmp_libreoffice')
@@ -327,6 +344,8 @@ def log_timeout_config():
           f" {HTTP_RETRY_TOTAL} retries,"
           f" backoff x{HTTP_RETRY_BACKOFF_FACTOR} (max {HTTP_RETRY_BACKOFF_MAX}s),"
           f" respect Retry-After: {HTTP_RESPECT_RETRY_AFTER}")
+    print(f"   download             : {DOWNLOAD_ATTEMPTS} whole-transfer attempt(s),"
+          f" Content-Length verified")
     worst_http = http_worst_case_seconds()
     print(f"   worst case per http call : {worst_http:.0f}s"
           f" ({HTTP_RETRY_TOTAL + 1} attempts + {http_backoff_seconds():.1f}s backoff)")
@@ -1659,11 +1678,13 @@ def fetch_job(doc_id, deadline=None):
     }
 
 
-def fetch_queue_batch(limit, order, exclude_ids=(), offset=0):
+def fetch_queue_batch(limit, order, exclude_ids=(), offset=0, created_after=""):
     """One request -> up to `limit` jobs, each already carrying its file_url."""
     params = {"limit": limit}
     if order:
         params["order"] = order
+    if created_after:
+        params["created_after"] = created_after
     if offset:
         params["offset"] = offset
     if exclude_ids:
@@ -1733,7 +1754,10 @@ def dispatch_from_service(job_queue, result_queue, limit):
 
         batch_size = min(QUEUE_BATCH_SIZE, limit - dispatched)
         try:
-            jobs = fetch_queue_batch(batch_size, QUEUE_ORDER, exclude, offset)
+            jobs = fetch_queue_batch(
+                batch_size, QUEUE_ORDER, exclude, offset,
+                created_after=QUEUE_CREATED_AFTER,
+            )
         except requests.RequestException as exc:
             print(f"❌ Queue request failed: {exc}")
             break
@@ -1755,6 +1779,7 @@ def dispatch_from_service(job_queue, result_queue, limit):
             break
 
         print(f"📥 Fetched {len(jobs)} job(s) | order={QUEUE_ORDER or 'server default'}"
+              f" | since={QUEUE_CREATED_AFTER or 'server default'}"
               f" | excluded={len(exclude)} | offset={offset}")
         for job in jobs:
             if dispatched >= limit:
