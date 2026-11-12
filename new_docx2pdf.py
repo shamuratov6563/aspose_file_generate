@@ -3,11 +3,13 @@ import os
 import resource
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
 from contextlib import ExitStack
 from multiprocessing import Process, Queue, cpu_count
+from queue import Empty
 
 import requests
 from PIL import Image
@@ -63,11 +65,46 @@ def env_bool(name: str, default: bool) -> bool:
     print(f"WARNING: {name}={raw!r} is not a boolean, using default {default}")
     return default
 
+def env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    return raw.strip() if raw and raw.strip() else default
+
+
 # Access environment variables
-TOKEN = os.getenv("TOKEN")
 BASE_URL = os.getenv("BASE_URL")
+# Shared secret for the poster-generation service API. This replaces the old
+# superuser Bearer token: the service endpoints only expose moderation-queue
+# documents and only accept poster images, so a leaked key here cannot edit
+# prices, approve products or read seller data the way the admin token could.
+SECRET_KEY = env_str("SECRET_KEY")
+# Legacy: only still used if SERVICE_API=0 pins the run to the old admin API.
+TOKEN = os.getenv("TOKEN")
+USE_SERVICE_API = env_bool("SERVICE_API", True)
 LIMIT = env_int("LIMIT", 10000)
 START_ID = env_int("START_ID", 1195807)
+
+# ---- Service queue ----
+# How many jobs to pull per queue request. One call now carries file_url for
+# every document, so the old "one GET for the next id + one GET for its
+# metadata, per document" pattern collapses to a single request per batch.
+QUEUE_BATCH_SIZE = env_int("QUEUE_BATCH_SIZE", 50)
+# Walk order asked of the server:
+#   fair   -- sellers with the fewest documents still waiting first, oldest
+#             first within a seller, so one bulk uploader cannot block everyone
+#   oldest -- plain oldest upload first
+#   newest -- newest upload first
+# Empty leaves the choice to the server's POSTER_QUEUE_ORDER setting.
+QUEUE_ORDER = env_str("QUEUE_ORDER", "fair").lower()
+VALID_QUEUE_ORDERS = ("", "fair", "oldest", "newest")
+if QUEUE_ORDER not in VALID_QUEUE_ORDERS:
+    print(f"WARNING: QUEUE_ORDER={QUEUE_ORDER!r} is not one of"
+          f" {VALID_QUEUE_ORDERS}, falling back to 'fair'")
+    QUEUE_ORDER = "fair"
+# A document the worker keeps failing on stays in the queue (it never gets a
+# poster), so without this the producer would hand out the same bad id forever.
+# Failed ids are sent back as `exclude_ids` and, past that cap, stepped over
+# with `offset`.
+QUEUE_MAX_EXCLUDE_IDS = env_int("QUEUE_MAX_EXCLUDE_IDS", 500)
 
 # Define a local temporary directory to bypass Snap sandboxing which often prevents access to system /tmp
 LOCAL_TMP_DIR = os.path.join(os.getcwd(), 'tmp_libreoffice')
@@ -77,7 +114,26 @@ os.makedirs(LOCAL_TMP_DIR, exist_ok=True)
 # Without this a failed doc is silently skipped and stays stuck in moderation forever.
 FAILED_LOG = os.getenv("FAILED_LOG", os.path.join(os.getcwd(), "failed_doc_ids.log"))
 
-headers = {'Authorization': f"Bearer {TOKEN}"}
+if USE_SERVICE_API:
+    if not SECRET_KEY:
+        raise SystemExit(
+            "SECRET_KEY is required: it is the X-Secret-Key for the poster service API"
+            " (SECURE_KEY on the Soff server). Set SERVICE_API=0 to fall back to the"
+            " old admin API with TOKEN."
+        )
+    headers = {"X-Secret-Key": SECRET_KEY}
+else:
+    if not TOKEN:
+        raise SystemExit("SERVICE_API=0 needs TOKEN (admin Bearer token)")
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+# Service API (secret key, moderation queue only)
+QUEUE_URL = f"{BASE_URL}/api/v1/seller/service/poster/queue/"
+JOB_URL = f"{BASE_URL}/api/v1/seller/service/poster/document/{{doc_id}}/"
+UPLOAD_URL = f"{BASE_URL}/api/v1/seller/service/poster/upload/"
+# Legacy admin API (superuser token, shared with the admin panel)
+LEGACY_NEXT_URL = f"{BASE_URL}/api/v1/seller/moderation-change/"
+LEGACY_DETAIL_URL = f"{BASE_URL}/api/v1/seller/admin/product-list/{{doc_id}}/"
 
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT_SECONDS", 120)
 DOWNLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB chunks for large files
@@ -267,7 +323,10 @@ _retry_kwargs = dict(
     total=HTTP_RETRY_TOTAL,
     backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
     status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=("GET", "PATCH"),
+    # POST is retryable here because the upload endpoint is idempotent: a file
+    # that already has images comes back with already_done=true instead of
+    # collecting duplicates.
+    allowed_methods=("GET", "PATCH", "POST"),
     respect_retry_after_header=HTTP_RESPECT_RETRY_AFTER,
 )
 if "backoff_max" in inspect.signature(Retry.__init__).parameters:
@@ -278,6 +337,14 @@ retry_strategy = Retry(**_retry_kwargs)
 adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=16, pool_maxsize=32)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
+
+# Document downloads go to S3 / the CDN, not to soff.uz. Reusing `session` for
+# them sent our credentials to that third-party host on every file (the old
+# code did this with the superuser Bearer token). Same retry policy, no auth
+# header, and the presigned/public URL needs none.
+download_session = requests.Session()
+download_session.mount("https://", adapter)
+download_session.mount("http://", adapter)
 
 
 def get_pdf_page_count(pdf_path: str) -> int | None:
@@ -813,7 +880,7 @@ def pdf_to_images_webp(
 
 def download_file(file_url, save_path, deadline=None):
     timeout = stage_timeout(deadline, "download", REQUEST_TIMEOUT)
-    with session.get(file_url, stream=True, timeout=timeout) as response:
+    with download_session.get(file_url, stream=True, timeout=timeout) as response:
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
@@ -1011,7 +1078,14 @@ def record_failure(doc_id, reason):
         print(f"⚠️ Could not write to {FAILED_LOG}: {exc}")
 
 
-def generate_docs_for_soff(doc_id):
+def generate_docs_for_soff(job):
+    """
+    Render one document's pages and upload them.
+
+    `job` is a dict from the queue endpoint (document_id, file_id, file_url,
+    file_type). A bare int is still accepted -- the id is then resolved with one
+    request, which is how the failed-id replay path works.
+    """
     temp_path = None
     output_folder = None
     success = False
@@ -1020,32 +1094,26 @@ def generate_docs_for_soff(doc_id):
     doc_start = time.monotonic()
     if deadline is not None:
         print(f"⏱️  Document budget: {DOC_TOTAL_TIMEOUT}s total")
+    doc_id = job["document_id"] if isinstance(job, dict) else job
     try:
         print(f"\n{'#'*80}")
         print(f"🆔 Processing document ID: {doc_id}")
         print(f"{'#'*80}")
-        
-        response = session.get(
-            f'{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/',
-            stream=True,
-            timeout=stage_timeout(deadline, "metadata fetch", REQUEST_TIMEOUT),
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        # Check if 'document' exists in response for safer access
-        document_data = data.get('document')
-        if not document_data:
-            print(f"❌ Error: 'document' key missing in API response for doc_id={doc_id}")
-            print(f"🔍 Full Response: {data}")
-            return True
 
-        file_type = document_data.get('file_type', '').lower()
-        file_url = document_data.get('file_url')
-        
+        if not isinstance(job, dict):
+            # Only the replay path gets here; a batch from the queue already
+            # carries everything below.
+            job = fetch_job(doc_id, deadline=deadline)
+            if job is None:
+                return True
+
+        file_id = job.get("file_id")
+        file_type = (job.get("file_type") or "").lower()
+        file_url = job.get("file_url")
+
         if not file_url:
             print(f"⚠️  No file URL found for doc_id={doc_id}, skipping")
-            print(f"🔍 Document Data: {document_data}")
+            print(f"🔍 Job: {job}")
             return True
         temp_path = f"temp_copy_{doc_id}{file_type}"
         output_folder = f"images_slide_copy_{doc_id}"
@@ -1148,21 +1216,36 @@ def generate_docs_for_soff(doc_id):
                     (os.path.basename(path), file_handle, "image/webp"),
                 ))
 
-            data = {'page_count': pages_count}
             print(f"   📊 Page count: {pages_count}")
 
-            patch_response = session.patch(
-                f"{BASE_URL}/api/v1/seller/admin/product-list/{doc_id}/",
-                files=files,
-                data=data,
-                # The images already exist by now, so refusing to upload would
-                # throw away the whole conversion. The upload always gets its
-                # own full timeout; it can overshoot the document budget by at
-                # most REQUEST_TIMEOUT_SECONDS.
-                timeout=REQUEST_TIMEOUT,
-            )
+            # The images already exist by now, so refusing to upload would
+            # throw away the whole conversion. The upload always gets its own
+            # full timeout; it can overshoot the document budget by at most
+            # REQUEST_TIMEOUT_SECONDS.
+            if USE_SERVICE_API:
+                data = {"document_id": doc_id, "page_count": pages_count}
+                if file_id:
+                    # Studio products hold several files; say which one these
+                    # pages belong to instead of letting the server guess.
+                    data["file_id"] = file_id
+                upload_response = session.post(
+                    UPLOAD_URL, files=files, data=data, timeout=REQUEST_TIMEOUT
+                )
+            else:
+                upload_response = session.patch(
+                    LEGACY_DETAIL_URL.format(doc_id=doc_id),
+                    files=files,
+                    data={"page_count": pages_count},
+                    timeout=REQUEST_TIMEOUT,
+                )
             # Without this an upload that 500s still printed "COMPLETED"
-            patch_response.raise_for_status()
+            upload_response.raise_for_status()
+            if USE_SERVICE_API:
+                try:
+                    if upload_response.json().get("already_done"):
+                        print("   ℹ️  Server already had images for this file")
+                except ValueError:
+                    pass
         upload_time = time.time() - upload_start
         print(f"✅ Upload completed in {upload_time:.1f}s")
         
@@ -1206,33 +1289,158 @@ def generate_docs_for_soff(doc_id):
     return success
 
 
+# ========= Job fetching =========
+
+
+def fetch_job(doc_id, deadline=None):
+    """
+    Resolve one document id to a job dict. Only used for replaying an id by
+    hand (e.g. from failed_doc_ids.log); a batch from the queue already carries
+    everything. Returns None when there is nothing to render.
+    """
+    timeout = stage_timeout(deadline, "metadata fetch", REQUEST_TIMEOUT)
+
+    if USE_SERVICE_API:
+        response = session.get(JOB_URL.format(doc_id=doc_id), timeout=timeout)
+        if response.status_code == 404:
+            print(f"⚠️  doc_id={doc_id} is not waiting for a poster, skipping")
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    response = session.get(LEGACY_DETAIL_URL.format(doc_id=doc_id), timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    document_data = data.get("document")
+    if not document_data:
+        print(f"❌ 'document' key missing in admin API response for doc_id={doc_id}")
+        print(f"🔍 Full Response: {data}")
+        return None
+    return {
+        "document_id": doc_id,
+        "file_id": document_data.get("id"),
+        "file_type": (document_data.get("file_type") or "").lower(),
+        "file_url": document_data.get("file_url"),
+    }
+
+
+def fetch_queue_batch(limit, order, exclude_ids=(), offset=0):
+    """One request -> up to `limit` jobs, each already carrying its file_url."""
+    params = {"limit": limit}
+    if order:
+        params["order"] = order
+    if offset:
+        params["offset"] = offset
+    if exclude_ids:
+        params["exclude_ids"] = ",".join(str(i) for i in exclude_ids)
+
+    response = session.get(QUEUE_URL, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.json().get("results", [])
+
+
 # ========= Worker & Queue System =========
 
 
-def worker(queue: Queue):
+def worker(job_queue: Queue, result_queue: Queue):
     while True:
-        doc_id = queue.get()
-        if doc_id is None:  # Poison pill -> stop worker
+        job = job_queue.get()
+        if job is None:  # Poison pill -> stop worker
             break
-        if not generate_docs_for_soff(doc_id):
+        doc_id = job["document_id"] if isinstance(job, dict) else job
+        ok = generate_docs_for_soff(job)
+        if not ok:
             print(f"⚠️  doc_id={doc_id} FAILED -- recorded in {FAILED_LOG}")
+        # The producer needs both outcomes: a success leaves the server-side
+        # queue on its own, a failure does not and must be excluded by hand.
+        result_queue.put((doc_id, bool(ok)))
 
 
-def process_doc_poster_generate_queue(limit=None, workers=None, start_id=None):
-    limit = limit or LIMIT
-    start_id = start_id or START_ID
-    workers = workers or max(2, cpu_count() // 2)
-    queue = Queue(maxsize=workers * 2)
+def _drain_results(result_queue, in_flight, failed):
+    while True:
+        try:
+            doc_id, ok = result_queue.get_nowait()
+        except Empty:
+            return
+        in_flight.discard(doc_id)
+        if not ok:
+            failed.add(doc_id)
 
-    # Start workers
-    processes = [Process(target=worker, args=(queue,)) for _ in range(workers)]
-    for p in processes:
-        p.start()
 
+def dispatch_from_service(job_queue, result_queue, limit):
+    """
+    Pull batches from the service queue and hand them to the workers.
+
+    No cursor is needed: the queue is self-draining, because a document that
+    gets its images uploaded drops out of the server-side filter. What does
+    have to be carried is everything the server would otherwise hand out
+    twice -- the documents a worker is busy with right now (`in_flight`) and
+    the ones that failed for good this run (`failed`, which never leave the
+    queue because they never get a poster). Both go back as `exclude_ids`;
+    once that outgrows the server's cap the overflow is stepped over with
+    `offset` instead.
+    """
+    dispatched = 0
+    in_flight = set()
+    failed = set()
+
+    while dispatched < limit:
+        _drain_results(result_queue, in_flight, failed)
+
+        # in_flight first: excluding a busy document matters more than
+        # excluding one that already failed, since a duplicate means two
+        # workers rendering the same file at the same time.
+        exclude = list(in_flight) + sorted(failed)
+        offset = 0
+        if len(exclude) > QUEUE_MAX_EXCLUDE_IDS:
+            offset = len(exclude) - QUEUE_MAX_EXCLUDE_IDS
+            exclude = exclude[:QUEUE_MAX_EXCLUDE_IDS]
+
+        batch_size = min(QUEUE_BATCH_SIZE, limit - dispatched)
+        try:
+            jobs = fetch_queue_batch(batch_size, QUEUE_ORDER, exclude, offset)
+        except requests.RequestException as exc:
+            print(f"❌ Queue request failed: {exc}")
+            break
+
+        if not jobs:
+            if in_flight:
+                # Everything left is being worked on. Wait for one result and
+                # ask again instead of declaring the queue empty.
+                print(f"⏳ Queue empty, {len(in_flight)} document(s) still in flight...")
+                try:
+                    doc_id, ok = result_queue.get(timeout=REQUEST_TIMEOUT)
+                except Empty:
+                    break
+                in_flight.discard(doc_id)
+                if not ok:
+                    failed.add(doc_id)
+                continue
+            print("✅ Queue is empty, nothing left to generate")
+            break
+
+        print(f"📥 Fetched {len(jobs)} job(s) | order={QUEUE_ORDER or 'server default'}"
+              f" | excluded={len(exclude)} | offset={offset}")
+        for job in jobs:
+            if dispatched >= limit:
+                break
+            in_flight.add(job["document_id"])
+            print(f"📥 Queued doc_id={job['document_id']}")
+            job_queue.put(job)  # blocks on back-pressure, which paces the run
+            dispatched += 1
+            _drain_results(result_queue, in_flight, failed)
+
+    print(f"\n📊 Dispatched {dispatched} document(s) | {len(failed)} failed this run")
+    if failed:
+        print(f"   Failed ids: {sorted(failed)}")
+
+
+def dispatch_from_legacy_api(job_queue, limit, start_id):
+    """The old admin-API walk: one request for the next id, per document."""
     start = start_id
 
     for _ in range(limit):
-        endpoint = f"{BASE_URL}/api/v1/seller/moderation-change/?type=true"
+        endpoint = f"{LEGACY_NEXT_URL}?type=true"
         if start:
             endpoint += f"&pk={start}"
 
@@ -1243,20 +1451,63 @@ def process_doc_poster_generate_queue(limit=None, workers=None, start_id=None):
             if not doc_id:
                 break
             print(f"📥 Queued doc_id={doc_id}")
-            queue.put(doc_id)
-            print("last...")
+            job_queue.put(doc_id)
             start = doc_id
 
         time.sleep(0.2)  # avoid hammering API
 
-    # Stop workers
-    for _ in processes:
-        queue.put(None)
+
+def process_doc_poster_generate_queue(limit=None, workers=None, start_id=None):
+    limit = limit or LIMIT
+    workers = workers or max(2, cpu_count() // 2)
+    job_queue = Queue(maxsize=workers * 2)
+    result_queue = Queue()
+
+    # Start workers
+    processes = [
+        Process(target=worker, args=(job_queue, result_queue)) for _ in range(workers)
+    ]
     for p in processes:
-        p.join()
+        p.start()
+
+    try:
+        if USE_SERVICE_API:
+            dispatch_from_service(job_queue, result_queue, limit)
+        else:
+            dispatch_from_legacy_api(job_queue, limit, start_id or START_ID)
+    finally:
+        # Stop workers
+        for _ in processes:
+            job_queue.put(None)
+        for p in processes:
+            p.join()
+
+
+def replay_failed_ids(doc_ids, workers=None):
+    """Re-run specific ids, e.g. the ones recorded in failed_doc_ids.log."""
+    workers = workers or max(2, cpu_count() // 2)
+    job_queue = Queue(maxsize=workers * 2)
+    result_queue = Queue()
+    processes = [
+        Process(target=worker, args=(job_queue, result_queue)) for _ in range(workers)
+    ]
+    for p in processes:
+        p.start()
+    try:
+        for doc_id in doc_ids:
+            job_queue.put(int(doc_id))
+    finally:
+        for _ in processes:
+            job_queue.put(None)
+        for p in processes:
+            p.join()
 
 
 if __name__ == "__main__":
     log_timeout_config()
     workers_env = env_int("WORKER_COUNT", 4)
-    process_doc_poster_generate_queue(workers=workers_env)
+    if len(sys.argv) > 1:
+        # `python new_docx2pdf.py 123 456` re-runs those ids and nothing else.
+        replay_failed_ids(sys.argv[1:], workers=workers_env)
+    else:
+        process_doc_poster_generate_queue(workers=workers_env)
